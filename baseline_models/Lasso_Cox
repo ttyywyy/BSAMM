@@ -1,0 +1,485 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# Late-fusion Lasso-Cox (R) — cleaned, commented, anonymized
+# ============================================================
+# 目标：
+#   (1) 对每个模态分别做 Lasso-Cox（基于训练集预筛选后的特征）
+#       -> 输出：cv.glmnet 模型、非零系数、训练集 risk score（及 high/low 分组）
+#   (2) 用训练好的各模态 Lasso 模型在验证/测试集上计算 risk score
+#       -> 输出：每个模态在各队列的 risk score 文件
+#   (3) 后融合（late fusion）：用各模态 risk score 拟合 Cox（rms::cph）
+#       -> 输出：融合 Cox 模型、nomogram、train/val/test 融合 risk score
+#
+# ★隐私处理★
+#   - 所有真实路径、队列简称、ID 仅用占位符（例如 <TRAIN_SIGEXP_MRI>）
+#   - 你只需要在 “0) 路径与参数” 部分替换为自己的路径即可
+#
+# 依赖：
+#   survival, glmnet, tidyverse, rms
+# ============================================================
+
+# -----------------------------
+# 0) 路径与参数（请改这里）
+# -----------------------------
+# 建议：统一把所有输入/输出放到一个工程目录下
+OUT_DIR <- "<OUTPUT_DIR>"  # 例如 "./results_lasso_late_fusion"
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# 训练集：预筛选后的“宽表”（行=患者；列包含 time/event + 预筛选后的特征）
+# 说明：这些文件通常由单因素 Cox 过滤后导出（train_*_uniSigExp.txt）
+TRAIN_SIGEXP <- list(
+  MRI       = "<TRAIN_SIGEXP_MRI>",       # e.g. "./train_MRI_uniSigExp.txt"
+  WSI       = "<TRAIN_SIGEXP_WSI>",       # e.g. "./train_WSI_uniSigExp.txt"
+  PATH      = "<TRAIN_SIGEXP_PATH>",      # e.g. "./train_pathology_report_uniSigExp.txt"
+  CLINICAL  = "<TRAIN_SIGEXP_CLINICAL>"   # e.g. "./train_clinical_uniSigExp.txt"
+)
+
+# 外部队列（验证集/测试集）：特征文件 + 生存文件（建议分开，便于复用）
+# 如果你的 features.csv 里已经包含 time/event，也可以把 survival 设为 NA
+COHORTS <- list(
+  VAL = list(
+    features = list(
+      MRI      = "<VAL_FEATURE_MRI>",      # e.g. "./val_MRI_features.csv"
+      WSI      = "<VAL_FEATURE_WSI>",
+      PATH     = "<VAL_FEATURE_PATH>",     # pathology report / IHC
+      CLINICAL = "<VAL_FEATURE_CLINICAL>"
+    ),
+    survival = "<VAL_SURVIVAL>"            # e.g. "./val_survival.csv"  (columns: id,time,event)
+  ),
+  TEST = list(
+    features = list(
+      MRI      = "<TEST_FEATURE_MRI>",
+      WSI      = "<TEST_FEATURE_WSI>",
+      PATH     = "<TEST_FEATURE_PATH>",
+      CLINICAL = "<TEST_FEATURE_CLINICAL>"
+    ),
+    survival = "<TEST_SURVIVAL>"
+  )
+)
+
+# Cox 时间单位说明：
+# - 如果你的 time 单位是“年”，则 time_points_year <- c(1,2,3) 直接可用
+# - 如果你的 time 单位是“月”，常见做法：先 time_year = time/12，再拟合/作图
+TIME_UNIT <- c("year", "month")[1]  # 改成 "month" 则会自动 /12
+
+# Lasso 设置
+PRED_TYPE      <- "response"  # 与原脚本一致：glmnet for cox 的 response = exp(lp)
+LAMBDA_CHOICE  <- "lambda.min" # 可选 "lambda.1se"
+RISK_CUTOFF    <- "median"     # 风险分组阈值：median 或自定义数值
+
+set.seed(2025)
+
+# -----------------------------
+# 1) 加载包
+# -----------------------------
+suppressPackageStartupMessages({
+  library(survival)
+  library(glmnet)
+  library(tidyverse)
+  library(rms)
+})
+
+# -----------------------------
+# 2) 工具函数
+# -----------------------------
+# 2.1 读取“sigexp”训练表：行名=患者ID；列包含 time/event + 多个特征
+read_sigexp <- function(path) {
+  df <- read.delim(path, row.names = 1, check.names = FALSE)
+  df <- na.omit(df)
+  if (!all(c("time", "event") %in% colnames(df))) {
+    stop("sigexp 文件必须包含列: time, event")
+  }
+  df
+}
+
+# 2.2 读取特征表（features.csv）：行名=患者ID；列=特征（可选含 time/event）
+read_features <- function(path) {
+  df <- read.csv(path, row.names = 1, check.names = FALSE)
+  df
+}
+
+# 2.3 读取生存表：列至少包含 id/time/event
+read_survival <- function(path) {
+  df <- read.csv(path, check.names = FALSE)
+  # 兼容大小写或不同列名（你也可以在此处按实际情况改）
+  col_map <- c(id = "id", time = "time", event = "event")
+  miss <- setdiff(unname(col_map), colnames(df))
+  if (length(miss) > 0) {
+    stop("survival 文件缺少列：", paste(miss, collapse = ", "))
+  }
+  df %>% dplyr::select(all_of(unname(col_map)))
+}
+
+# 2.4 把 features 与 survival 按 id 合并到一个 data.frame（行名=id）
+attach_survival_if_needed <- function(features_df, survival_path) {
+  if (all(c("time", "event") %in% colnames(features_df))) {
+    return(features_df)
+  }
+  if (is.na(survival_path) || survival_path == "") {
+    stop("features 不含 time/event，且 survival_path 未提供。")
+  }
+  surv_df <- read_survival(survival_path)
+
+  features_df <- features_df %>% rownames_to_column(var = "id")
+  merged <- left_join(surv_df, features_df, by = "id") %>%
+    column_to_rownames(var = "id")
+  merged <- na.omit(merged)
+  merged
+}
+
+# 2.5 从训练 sigexp 中提取 x/y
+make_xy_from_sigexp <- function(sigexp_df) {
+  x <- as.matrix(sigexp_df %>% dplyr::select(-time, -event))
+  y <- data.matrix(Surv(sigexp_df$time, sigexp_df$event))
+  list(x = x, y = y)
+}
+
+# 2.6 统一保存 glmnet 路径图与 CV 图
+save_glmnet_plots <- function(fit, cvfit, out_prefix) {
+  pdf(file.path(OUT_DIR, paste0(out_prefix, "_lambda_path.pdf")))
+  plot(fit, xvar = "lambda", label = TRUE)
+  dev.off()
+
+  pdf(file.path(OUT_DIR, paste0(out_prefix, "_cvfit.pdf")))
+  plot(cvfit)
+  abline(v = log(c(cvfit$lambda.min, cvfit$lambda.1se)), lty = "dashed")
+  dev.off()
+}
+
+# 2.7 训练单模态 Lasso-Cox，并导出：系数、训练 risk score、模型 rds
+fit_lasso_cox_modality <- function(sigexp_path, out_prefix) {
+  sigexp <- read_sigexp(sigexp_path)
+  xy <- make_xy_from_sigexp(sigexp)
+
+  # glmnet + cv.glmnet
+  fit   <- glmnet(xy$x, xy$y, family = "cox", maxit = 1000)
+  cvfit <- cv.glmnet(xy$x, xy$y, family = "cox", maxit = 1000)
+
+  save_glmnet_plots(fit, cvfit, out_prefix)
+
+  # 选 lambda
+  s_val <- ifelse(LAMBDA_CHOICE == "lambda.1se", "lambda.1se", "lambda.min")
+
+  # 导出非零系数
+  coef_mat <- coef(fit, s = cvfit[[s_val]])
+  idx      <- which(coef_mat != 0)
+  lasso_feat <- rownames(coef_mat)[idx]
+  act_coef   <- as.numeric(coef_mat[idx])
+
+  coef_df <- data.frame(
+    feature = lasso_feat,
+    coef    = act_coef
+  )
+  write.table(coef_df,
+              file = file.path(OUT_DIR, paste0(out_prefix, "_coef.txt")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  # 训练集 risk score（与原脚本一致：type="response"）
+  risk_score <- as.vector(predict(cvfit, newx = xy$x, s = s_val, type = PRED_TYPE))
+  cutoff_val <- if (RISK_CUTOFF == "median") median(risk_score) else as.numeric(RISK_CUTOFF)
+  risk_group <- ifelse(risk_score > cutoff_val, "high", "low")
+
+  out_tab <- sigexp %>%
+    dplyr::select(time, event, all_of(lasso_feat)) %>%
+    mutate(risk_score = risk_score,
+           risk_group = risk_group) %>%
+    rownames_to_column(var = "id")
+
+  write.table(out_tab,
+              file = file.path(OUT_DIR, paste0(out_prefix, "_risk_train.txt")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  # 保存模型（只保存 cvfit 即可做预测；也可同时保存 fit）
+  saveRDS(cvfit, file = file.path(OUT_DIR, paste0(out_prefix, "_lasso_cvfit.rds")))
+
+  message("[OK] Trained Lasso-Cox for: ", out_prefix,
+          " | nonzero features = ", length(lasso_feat))
+  invisible(list(cvfit = cvfit, nonzero_features = lasso_feat, cutoff = cutoff_val))
+}
+
+# 2.8 用训练好的 cvfit 在新队列上预测 risk score（自动对齐特征）
+predict_lasso_risk <- function(cvfit_rds,
+                               train_sigexp_path,
+                               new_features_path,
+                               new_survival_path = NA,
+                               out_path,
+                               score_name = "risk_score") {
+
+  cvfit <- readRDS(cvfit_rds)
+  train_sigexp <- read_sigexp(train_sigexp_path)
+
+  # 训练时可用的特征集合（去掉 time/event）
+  train_feats <- setdiff(colnames(train_sigexp), c("time", "event"))
+
+  new_feat <- read_features(new_features_path)
+  new_df   <- attach_survival_if_needed(new_feat, new_survival_path)
+
+  # 对齐特征
+  common_feats <- intersect(train_feats, colnames(new_df))
+  if (length(common_feats) == 0) stop("新队列与训练特征没有交集，请检查特征名。")
+
+  x_new <- as.matrix(new_df[, common_feats, drop = FALSE])
+
+  s_val <- ifelse(LAMBDA_CHOICE == "lambda.1se", "lambda.1se", "lambda.min")
+  risk_score <- as.vector(predict(cvfit, newx = x_new, s = s_val, type = PRED_TYPE))
+
+  out_df <- new_df %>%
+    dplyr::select(time, event, all_of(common_feats)) %>%
+    mutate(!!score_name := risk_score) %>%
+    rownames_to_column(var = "id")
+
+  write.table(out_df, file = out_path, sep = "\t", quote = FALSE, row.names = FALSE)
+  message("[OK] Saved: ", out_path, " | n=", nrow(out_df))
+  invisible(out_df)
+}
+
+# 2.9 合并多个模态 risk score（按 id）-> 用于后融合 Cox
+merge_modal_scores <- function(mri_path, wsi_path, path_path, clinical_path, out_path) {
+  mri  <- read.delim(mri_path, check.names = FALSE)
+  wsi  <- read.delim(wsi_path, check.names = FALSE)
+  path <- read.delim(path_path, check.names = FALSE)
+  cln  <- read.delim(clinical_path, check.names = FALSE)
+
+  # 只保留 id/time/event + risk_score 列（避免把大量特征再带进去）
+  pick_score <- function(df, new_name) {
+    # 兼容不同列名（这里默认 risk_score）
+    if (!("risk_score" %in% colnames(df))) {
+      stop("缺少 risk_score 列：", new_name)
+    }
+    df %>% dplyr::select(id, time, event, risk_score) %>%
+      dplyr::rename(!!new_name := risk_score)
+  }
+
+  mri_s  <- pick_score(mri,  "riskScore_MRI")
+  wsi_s  <- pick_score(wsi,  "riskScore_WSI")
+  path_s <- pick_score(path, "riskScore_PATH")
+  cln_s  <- pick_score(cln,  "riskScore_CLINICAL")
+
+  merged <- mri_s %>%
+    left_join(wsi_s,  by = c("id", "time", "event")) %>%
+    left_join(path_s, by = c("id", "time", "event")) %>%
+    left_join(cln_s,  by = c("id", "time", "event")) %>%
+    na.omit()
+
+  write.table(merged, file = out_path, sep = "\t", quote = FALSE, row.names = FALSE)
+  message("[OK] Merged modality scores -> ", out_path, " | n=", nrow(merged))
+  merged
+}
+
+# 2.10 拟合后融合 Cox（rms::cph），输出 nomogram & 风险分数
+fit_late_fusion_cox <- function(train_merged_path,
+                                out_model_rds,
+                                out_train_risk,
+                                time_points = c(1, 2, 3)) {
+
+  rt <- read.table(train_merged_path, sep = "\t", header = TRUE, check.names = FALSE)
+
+  # 时间单位处理：如果 time 是月，统一换算为年，便于解释
+  if (TIME_UNIT == "month") {
+    rt$time <- rt$time / 12
+  }
+
+  rt <- rt %>% column_to_rownames(var = "id")
+
+  dd <- datadist(rt); options(datadist = "dd")
+
+  f <- cph(
+    Surv(time, event) ~ riskScore_MRI + riskScore_WSI + riskScore_PATH + riskScore_CLINICAL,
+    data = rt, x = TRUE, y = TRUE, surv = TRUE
+  )
+
+  saveRDS(f, file = out_model_rds)
+
+  # 线性预测值（lp）作为融合 risk score
+  lp <- predict(f, type = "lp")
+  train_score <- data.frame(id = names(lp), riskScore = as.numeric(lp))
+
+  cutoff <- median(train_score$riskScore, na.rm = TRUE)
+  train_score <- train_score %>%
+    mutate(risk_group = ifelse(riskScore > cutoff, "high", "low"))
+
+  out_df <- rt %>% rownames_to_column(var = "id") %>%
+    left_join(train_score, by = "id")
+
+  write.table(out_df, file = out_train_risk, sep = "\t", quote = FALSE, row.names = FALSE)
+
+  # Nomogram（PFS at specified time_points）
+  surv_fun <- Survival(f)
+  nom <- nomogram(
+    f,
+    fun = lapply(time_points, function(t) function(x) surv_fun(t, x)),
+    lp = FALSE,
+    funlabel = paste0(time_points, "-year PFS"),
+    maxscale = 50
+  )
+
+  pdf(file.path(OUT_DIR, "nomogram_late_fusion.pdf"), height = 6, width = 10)
+  plot(nom)
+  dev.off()
+
+  message("[OK] Late-fusion Cox fitted. Model saved: ", out_model_rds)
+  invisible(list(model = f, cutoff = cutoff))
+}
+
+# 2.11 用后融合 Cox 模型在 val/test 上预测（按训练 cutoff 分组）
+predict_late_fusion <- function(model_rds,
+                                train_nomo_path,
+                                merged_score_path,
+                                out_path) {
+
+  f <- readRDS(model_rds)
+
+  train_ref <- read.table(train_nomo_path, sep = "\t", header = TRUE, check.names = FALSE)
+  cutoff <- median(train_ref$riskScore, na.rm = TRUE)
+
+  df <- read.table(merged_score_path, sep = "\t", header = TRUE, check.names = FALSE)
+
+  if (TIME_UNIT == "month") df$time <- df$time / 12
+
+  # newdata 只需要 4 个 riskScore 列
+  risk_lp <- predict(f, newdata = df, type = "lp")
+  out <- df %>%
+    mutate(riskScore = as.numeric(risk_lp),
+           risk_group = ifelse(riskScore > cutoff, "high", "low"))
+
+  write.table(out, file = out_path, sep = "\t", quote = FALSE, row.names = FALSE)
+  message("[OK] Saved late-fusion predictions: ", out_path)
+  out
+}
+
+# -----------------------------
+# 3) 主流程（你可以按需注释/启用）
+# -----------------------------
+
+# 3.1 训练各模态 Lasso-Cox（训练集）
+# 注意：out_prefix 用于命名输出文件
+res_mri  <- fit_lasso_cox_modality(TRAIN_SIGEXP$MRI,      out_prefix = "MRI")
+res_wsi  <- fit_lasso_cox_modality(TRAIN_SIGEXP$WSI,      out_prefix = "WSI")
+res_path <- fit_lasso_cox_modality(TRAIN_SIGEXP$PATH,     out_prefix = "PATH")
+res_cln  <- fit_lasso_cox_modality(TRAIN_SIGEXP$CLINICAL, out_prefix = "CLINICAL")
+
+# 3.2 计算验证/测试各模态 risk score（把 time/event 合并进来）
+# 输出文件会写入 OUT_DIR
+# ---- VAL ----
+val_mri  <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "MRI_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$MRI,
+  new_features_path  = COHORTS$VAL$features$MRI,
+  new_survival_path  = COHORTS$VAL$survival,
+  out_path           = file.path(OUT_DIR, "VAL_MRI_risk.txt"),
+  score_name         = "risk_score"
+)
+
+val_wsi  <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "WSI_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$WSI,
+  new_features_path  = COHORTS$VAL$features$WSI,
+  new_survival_path  = COHORTS$VAL$survival,
+  out_path           = file.path(OUT_DIR, "VAL_WSI_risk.txt"),
+  score_name         = "risk_score"
+)
+
+val_path <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "PATH_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$PATH,
+  new_features_path  = COHORTS$VAL$features$PATH,
+  new_survival_path  = COHORTS$VAL$survival,
+  out_path           = file.path(OUT_DIR, "VAL_PATH_risk.txt"),
+  score_name         = "risk_score"
+)
+
+val_cln  <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "CLINICAL_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$CLINICAL,
+  new_features_path  = COHORTS$VAL$features$CLINICAL,
+  new_survival_path  = COHORTS$VAL$survival,
+  out_path           = file.path(OUT_DIR, "VAL_CLINICAL_risk.txt"),
+  score_name         = "risk_score"
+)
+
+# ---- TEST ----（同理）
+test_mri  <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "MRI_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$MRI,
+  new_features_path  = COHORTS$TEST$features$MRI,
+  new_survival_path  = COHORTS$TEST$survival,
+  out_path           = file.path(OUT_DIR, "TEST_MRI_risk.txt"),
+  score_name         = "risk_score"
+)
+
+test_wsi  <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "WSI_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$WSI,
+  new_features_path  = COHORTS$TEST$features$WSI,
+  new_survival_path  = COHORTS$TEST$survival,
+  out_path           = file.path(OUT_DIR, "TEST_WSI_risk.txt"),
+  score_name         = "risk_score"
+)
+
+test_path <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "PATH_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$PATH,
+  new_features_path  = COHORTS$TEST$features$PATH,
+  new_survival_path  = COHORTS$TEST$survival,
+  out_path           = file.path(OUT_DIR, "TEST_PATH_risk.txt"),
+  score_name         = "risk_score"
+)
+
+test_cln  <- predict_lasso_risk(
+  cvfit_rds          = file.path(OUT_DIR, "CLINICAL_lasso_cvfit.rds"),
+  train_sigexp_path  = TRAIN_SIGEXP$CLINICAL,
+  new_features_path  = COHORTS$TEST$features$CLINICAL,
+  new_survival_path  = COHORTS$TEST$survival,
+  out_path           = file.path(OUT_DIR, "TEST_CLINICAL_risk.txt"),
+  score_name         = "risk_score"
+)
+
+# 3.3 合并 4 个模态 risk score -> 生成 late fusion 输入表
+train_merged <- merge_modal_scores(
+  mri_path      = file.path(OUT_DIR, "MRI_risk_train.txt"),
+  wsi_path      = file.path(OUT_DIR, "WSI_risk_train.txt"),
+  path_path     = file.path(OUT_DIR, "PATH_risk_train.txt"),
+  clinical_path = file.path(OUT_DIR, "CLINICAL_risk_train.txt"),
+  out_path      = file.path(OUT_DIR, "TRAIN_all_risk_late_fusion.txt")
+)
+
+val_merged <- merge_modal_scores(
+  mri_path      = file.path(OUT_DIR, "VAL_MRI_risk.txt"),
+  wsi_path      = file.path(OUT_DIR, "VAL_WSI_risk.txt"),
+  path_path     = file.path(OUT_DIR, "VAL_PATH_risk.txt"),
+  clinical_path = file.path(OUT_DIR, "VAL_CLINICAL_risk.txt"),
+  out_path      = file.path(OUT_DIR, "VAL_all_risk_late_fusion.txt")
+)
+
+test_merged <- merge_modal_scores(
+  mri_path      = file.path(OUT_DIR, "TEST_MRI_risk.txt"),
+  wsi_path      = file.path(OUT_DIR, "TEST_WSI_risk.txt"),
+  path_path     = file.path(OUT_DIR, "TEST_PATH_risk.txt"),
+  clinical_path = file.path(OUT_DIR, "TEST_CLINICAL_risk.txt"),
+  out_path      = file.path(OUT_DIR, "TEST_all_risk_late_fusion.txt")
+)
+
+# 3.4 拟合 late fusion Cox + nomogram（训练集）
+fusion <- fit_late_fusion_cox(
+  train_merged_path = file.path(OUT_DIR, "TRAIN_all_risk_late_fusion.txt"),
+  out_model_rds     = file.path(OUT_DIR, "late_fusion_cox_model.rds"),
+  out_train_risk    = file.path(OUT_DIR, "TRAIN_nomo.txt"),
+  time_points       = c(1, 2, 3)
+)
+
+# 3.5 验证/测试：用融合模型预测并按训练集 median 分组
+val_pred <- predict_late_fusion(
+  model_rds         = file.path(OUT_DIR, "late_fusion_cox_model.rds"),
+  train_nomo_path   = file.path(OUT_DIR, "TRAIN_nomo.txt"),
+  merged_score_path = file.path(OUT_DIR, "VAL_all_risk_late_fusion.txt"),
+  out_path          = file.path(OUT_DIR, "VAL_nomo.txt")
+)
+
+test_pred <- predict_late_fusion(
+  model_rds         = file.path(OUT_DIR, "late_fusion_cox_model.rds"),
+  train_nomo_path   = file.path(OUT_DIR, "TRAIN_nomo.txt"),
+  merged_score_path = file.path(OUT_DIR, "TEST_all_risk_late_fusion.txt"),
+  out_path          = file.path(OUT_DIR, "TEST_nomo.txt")
+)
+
+message("✅ All done. Outputs are under: ", OUT_DIR)
