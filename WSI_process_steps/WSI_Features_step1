@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Trident WSI Batch Pipeline 
+# -----------------------------------------------------------------------------
+# What this script does:
+#   1) (Optional) Clone mahmoodlab/trident and install it in editable mode
+#   2) (Optional) Install commonly required Python dependencies
+#   3) (Optional) Clean & reinstall numpy/opencv to fix: libGL.so.1 ImportError
+#   4) Run Trident batch processing on a folder of WSIs
+#
+# Security note:
+#   - DO NOT hard-code Hugging Face tokens in this script.
+#   - Set HF_TOKEN as an environment variable before running:
+#       export HF_TOKEN="hf_********************************"
+#
+# Example usages:
+#   # Full install + run all tasks
+#   bash trident_openbayes_pipeline.sh --install --deps --task all \
+#     --wsi_dir xxx/input/input0 --job_dir /xxx/input/xxx \
+#     --patch_encoder uni_v2 --segmenter grandqc --mag 20 --patch_size 256
+#
+#   # Feature extraction only (no install)
+#   bash trident_openbayes_pipeline.sh --task feat \
+#     --wsi_dir xxx/input/input0 --job_dir /xxx/input/xxx \
+#     --slide_encoder titan --mag 20 --patch_size 256
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------
+# Defaults (edit if you want)
+# -----------------------------
+TRIDENT_REPO_URL="https://github.com/mahmoodlab/trident.git"
+TRIDENT_DIR="${PWD}/trident"
+
+WSI_DIR="xxx/input/input0"
+JOB_DIR="xxx/input/xxx"
+
+TASK="all"                 # all | feat | (others supported by trident)
+PATCH_ENCODER="uni_v2"     # used for --task all (patch-level)
+SLIDE_ENCODER="titan"      # used for --task feat (slide-level)
+SEGMENTER="grandqc"
+
+MAG="20"
+PATCH_SIZE="256"
+
+DO_INSTALL=false           # clone + pip install -e .
+DO_DEPS=false              # install extra dependencies
+DO_FIX_LIBGL=false         # clean reinstall numpy/opencv
+PYTHON_BIN="python"        # can override with --python python3
+
+# -----------------------------
+# Helpers
+# -----------------------------
+usage() {
+  cat <<'EOF'
+Usage:
+  bash trident_openbayes_pipeline.sh [options]
+
+Options:
+  --install                 Clone Trident and install (pip install -e .)
+  --deps                    Install common dependencies
+  --fix-libgl               Clean & reinstall numpy/opencv-headless to fix libGL.so.1 error
+
+  --task <all|feat|...>     Task mode for run_batch_of_slides.py (default: all)
+  --wsi_dir <path>          Input WSI directory (default: /xxx/input/input0)
+  --job_dir <path>          Output/job directory (default: /xxx/input/out_seg8)
+
+  --patch_encoder <name>    Patch encoder for task=all (default: uni_v2)
+  --slide_encoder <name>    Slide encoder for task=feat (default: titan)
+  --segmenter <name>        Segmenter (default: grandqc)
+
+  --mag <int>               Magnification, e.g., 20 (default: 20)
+  --patch_size <int>        Patch size, e.g., 256 (default: 256)
+
+  --trident_dir <path>      Where Trident repo is/should be located (default: ./trident)
+  --python <bin>            Python executable (default: python)
+
+Environment:
+  HF_TOKEN                  Hugging Face token (required by some encoders/models)
+                             export HF_TOKEN="hf_********************************"
+
+Examples:
+  export HF_TOKEN="hf_********"
+  bash trident_openbayes_pipeline.sh --install --deps --task all \
+    --wsi_dir /openbayes/input/input0 --job_dir /openbayes/input/out_seg8 \
+    --patch_encoder uni_v2 --segmenter grandqc --mag 20 --patch_size 256
+
+  bash trident_openbayes_pipeline.sh --task feat \
+    --wsi_dir /openbayes/input/input0 --job_dir /xxx/input/out_seg8 \
+    --slide_encoder titan --mag 20 --patch_size 256
+EOF
+}
+
+log() { echo -e "[INFO] $*"; }
+err() { echo -e "[ERROR] $*" >&2; }
+
+require_cmd() {
+  local c="$1"
+  command -v "$c" >/dev/null 2>&1 || { err "Command not found: $c"; exit 1; }
+}
+
+pip_install() {
+  # Always use python -m pip to avoid pip/python mismatch
+  "$PYTHON_BIN" -m pip install "$@"
+}
+
+pip_uninstall() {
+  "$PYTHON_BIN" -m pip uninstall -y "$@" || true
+}
+
+# -----------------------------
+# Parse args
+# -----------------------------
+if [[ $# -eq 0 ]]; then
+  # no args is valid; run with defaults
+  :
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install) DO_INSTALL=true; shift ;;
+    --deps) DO_DEPS=true; shift ;;
+    --fix-libgl) DO_FIX_LIBGL=true; shift ;;
+
+    --task) TASK="${2:?Missing value for --task}"; shift 2 ;;
+    --wsi_dir) WSI_DIR="${2:?Missing value for --wsi_dir}"; shift 2 ;;
+    --job_dir) JOB_DIR="${2:?Missing value for --job_dir}"; shift 2 ;;
+
+    --patch_encoder) PATCH_ENCODER="${2:?Missing value for --patch_encoder}"; shift 2 ;;
+    --slide_encoder) SLIDE_ENCODER="${2:?Missing value for --slide_encoder}"; shift 2 ;;
+    --segmenter) SEGMENTER="${2:?Missing value for --segmenter}"; shift 2 ;;
+
+    --mag) MAG="${2:?Missing value for --mag}"; shift 2 ;;
+    --patch_size) PATCH_SIZE="${2:?Missing value for --patch_size}"; shift 2 ;;
+
+    --trident_dir) TRIDENT_DIR="${2:?Missing value for --trident_dir}"; shift 2 ;;
+    --python) PYTHON_BIN="${2:?Missing value for --python}"; shift 2 ;;
+
+    -h|--help) usage; exit 0 ;;
+    *)
+      err "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+# -----------------------------
+# Pre-flight checks
+# -----------------------------
+require_cmd git
+require_cmd "$PYTHON_BIN"
+
+# Ensure pip exists
+"$PYTHON_BIN" -m pip --version >/dev/null 2>&1 || {
+  err "pip is not available for '$PYTHON_BIN'. Try: $PYTHON_BIN -m ensurepip --upgrade"
+  exit 1
+}
+
+# Print summary
+log "Python      : $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+log "Trident dir : $TRIDENT_DIR"
+log "WSI dir     : $WSI_DIR"
+log "Job dir     : $JOB_DIR"
+log "Task        : $TASK"
+log "Mag         : $MAG"
+log "Patch size  : $PATCH_SIZE"
+log "Patch enc   : $PATCH_ENCODER"
+log "Slide enc   : $SLIDE_ENCODER"
+log "Segmenter   : $SEGMENTER"
+
+# -----------------------------
+# Step 1: Clone + install Trident
+# -----------------------------
+if $DO_INSTALL; then
+  if [[ ! -d "$TRIDENT_DIR/.git" ]]; then
+    log "Cloning Trident into: $TRIDENT_DIR"
+    git clone "$TRIDENT_REPO_URL" "$TRIDENT_DIR"
+  else
+    log "Trident repo already exists: $TRIDENT_DIR (skipping clone)"
+  fi
+
+  log "Installing Trident (editable mode): pip install -e ."
+  pushd "$TRIDENT_DIR" >/dev/null
+  pip_install -e .
+  popd >/dev/null
+else
+  log "Skipping Trident clone/install (use --install to enable)"
+fi
+
+# -----------------------------
+# Step 2: Install dependencies (common set you listed)
+# -----------------------------
+if $DO_DEPS; then
+  log "Installing extra dependencies..."
+  pip_install \
+    openslide-python openslide-bin \
+    opencv-python opencv-python-headless \
+    geopandas h5py segmentation_models_pytorch \
+    einops einops_exts
+else
+  log "Skipping dependency install (use --deps to enable)"
+fi
+
+# -----------------------------
+# Step 3: Fix libGL.so.1 ImportError (optional cleanup)
+# -----------------------------
+if $DO_FIX_LIBGL; then
+  log "Running cleanup to mitigate libGL.so.1 / OpenCV issues..."
+  pip_uninstall opencv-python opencv-python-headless numpy
+
+  # Purge pip cache (best-effort; may not exist in all pip versions)
+  "$PYTHON_BIN" -m pip cache purge || true
+
+  # Reinstall (no cache), then pin numpy < 2 (as you noted)
+  pip_install --no-cache-dir numpy opencv-python-headless
+  pip_install --upgrade "numpy<2"
+else
+  log "Skipping libGL/OpenCV cleanup (use --fix-libgl to enable)"
+fi
+
+# -----------------------------
+# Step 4: Run Trident batch script
+# -----------------------------
+# We try to locate run_batch_of_slides.py:
+#   - If you installed Trident, it should be inside TRIDENT_DIR.
+#   - If not installed/cloned, user must point TRIDENT_DIR to the repo location.
+RUN_SCRIPT="${TRIDENT_DIR}/run_batch_of_slides.py"
+if [[ ! -f "$RUN_SCRIPT" ]]; then
+  err "Cannot find run_batch_of_slides.py at: $RUN_SCRIPT"
+  err "Make sure Trident is cloned to TRIDENT_DIR or pass --trident_dir <path>."
+  exit 1
+fi
+
+# Some encoders require HF_TOKEN
+# We do a gentle check and warn; you can comment this out if not needed.
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  log "HF_TOKEN is not set. If your encoder/model needs it, run:"
+  log '  export HF_TOKEN="hf_********************************"'
+fi
+
+log "Creating job directory (if missing): $JOB_DIR"
+mkdir -p "$JOB_DIR"
+
+log "Running Trident: $TASK"
+if [[ "$TASK" == "feat" ]]; then
+  # Feature extraction only (slide-level encoder)
+  "$PYTHON_BIN" "$RUN_SCRIPT" \
+    --task feat \
+    --wsi_dir "$WSI_DIR" \
+    --job_dir "$JOB_DIR" \
+    --slide_encoder "$SLIDE_ENCODER" \
+    --mag "$MAG" \
+    --patch_size "$PATCH_SIZE"
+else
+  # Default path: run all tasks (segmentation + features, etc.)
+  "$PYTHON_BIN" "$RUN_SCRIPT" \
+    --task "$TASK" \
+    --wsi_dir "$WSI_DIR" \
+    --job_dir "$JOB_DIR" \
+    --patch_encoder "$PATCH_ENCODER" \
+    --mag "$MAG" \
+    --patch_size "$PATCH_SIZE" \
+    --segmenter "$SEGMENTER"
+fi
+
+log "Done."
