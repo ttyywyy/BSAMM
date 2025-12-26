@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DeepSurv（PyTorch）单文件：训练 + 风险分数计算（用于消融实验/基线模型）
+
+你提供的两个脚本分别负责：
+1) 训练 DeepSurv（MLP + Cox-PH loss）并保存最优权重；
+2) 加载最优权重，在新队列上计算 risk_score 和 C-index，并可导出 CSV。
+
+本文件将二者合并为一个可复用脚本，并做了以下“去隐私/可复现”整理：
+- ✅ 移除硬编码的本地绝对路径（如 /Volumes/...），全部改为命令行参数；
+- ✅ 不在控制台打印任何样本内容/ID；
+- ✅ 增加数据一致性检查（X/y 对齐、样本量检查）；
+- ✅ 增加日志输出、早停（early stopping）、随机种子控制；
+- ✅ 通过子命令 train / predict 切换训练与推理。
+
+----------------------------------------------------------------------
+数据格式约定（与原脚本保持一致）：
+- X.csv：行 = 样本（患者），列 = 数值特征（建议已完成缺失处理、标准化、one-hot 等）
+        默认使用 index_col=0 读取（即第一列为样本 ID/索引）
+- y.csv：行 = 样本（患者），至少包含两列：time, event
+        默认使用 index_col=0 读取（即第一列为样本 ID/索引）
+        time  : 随访时间（数值）
+        event : 结局事件（0/1；1=发生事件，0=删失）
+
+⚠️ 若 y.csv 的索引是患者 ID（敏感信息），建议在对外分享前先做脱敏（例如替换为随机编号）。
+----------------------------------------------------------------------
+
+用法示例：
+# 1) 训练（有独立验证集）
+python deepsurv_train_predict.py train \
+  --train-x /path/train_X.csv --train-y /path/train_y.csv \
+  --val-x   /path/val_X.csv   --val-y   /path/val_y.csv \
+  --out-dir /path/out_deepsurv \
+  --hidden-sizes 128 64 --dropout 0.5 --lr 1e-4 --weight-decay 1e-1 \
+  --epochs 500 --batch-size 128 --patience 60 --seed 63
+
+# 2) 训练（无独立验证集：按比例随机划分）
+python deepsurv_train_predict.py train \
+  --train-x /path/all_X.csv --train-y /path/all_y.csv \
+  --split-ratio 0.8 --out-dir /path/out_deepsurv
+
+# 3) 推理/计算风险分数（可导出）
+python deepsurv_train_predict.py predict \
+  --model /path/out_deepsurv/best_deepsurv.pth \
+  --x /path/test_X.csv --y /path/test_y.csv \
+  --out-csv /path/out_deepsurv/test_risk.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from lifelines.utils import concordance_index
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, random_split
+
+
+# -------------------------
+# 0) 通用工具
+# -------------------------
+def set_seed(seed: int) -> None:
+    """尽可能保证可复现（注意：某些 CUDA 算子仍可能存在非确定性）。"""
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # 让 cuDNN 尽量确定性（会略微降低速度）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def ensure_dir(path: str | Path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _as_device(device_str: str) -> torch.device:
+    if device_str.lower() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_str)
+
+
+# -------------------------
+# 1) Cox-PH loss（数值稳定版本）
+# -------------------------
+def cox_ph_loss(
+    risk_score: torch.Tensor,
+    time: torch.Tensor,
+    event: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    负对数部分似然（Cox proportional hazards）。
+
+    关键点：先按 time 降序排列，risk set 满足 t_j >= t_i。
+    使用 logcumsumexp 实现 log Σ exp(risk)，避免数值溢出。
+
+    risk_score: (B,) 模型输出（越大=风险越高）
+    time      : (B,) 随访时间
+    event     : (B,) 事件指示（1=发生事件，0=删失）
+    """
+    risk = risk_score.view(-1)
+    t = time.view(-1)
+    e = event.view(-1)
+
+    # ① 按时间降序排列
+    order = torch.argsort(t, descending=True)
+    risk, e = risk[order], e[order]
+
+    # ② log 累加求和：log Σ_{j>=i} exp(risk_j)
+    log_cumsum = torch.logcumsumexp(risk, dim=0)
+
+    # ③ 负对数部分似然（只对 event=1 的样本求和）
+    nll = -(e * (risk - log_cumsum)).sum()
+
+    # ④ 用事件数归一化，防止全删失时除以 0
+    return nll / (e.sum() + eps)
+
+
+# -------------------------
+# 2) DeepSurv MLP
+# -------------------------
+class DeepSurvMLP(nn.Module):
+    """全连接 MLP 输出一个标量 risk score（不做 sigmoid/softmax）。"""
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_sizes: Tuple[int, ...] = (128, 64),
+        dropout: float = 0.5,
+    ) -> None:
+        super().__init__()
+
+        layers: List[nn.Module] = []
+        in_dim = num_features
+        for h in hidden_sizes:
+            layers += [nn.Linear(in_dim, h), nn.ReLU(), nn.Dropout(dropout)]
+            in_dim = h
+        layers += [nn.Linear(in_dim, 1)]  # 输出 1 个 risk score
+
+        self.mlp = nn.Sequential(*layers)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x).squeeze(-1)  # (B,1) -> (B,)
+
+
+# -------------------------
+# 3) Dataset：读取 CSV 并对齐 X/y
+# -------------------------
+class SurvivalDataset(Dataset):
+    """
+    默认读取方式：
+      X = pd.read_csv(x_path, index_col=0)
+      y = pd.read_csv(y_path, index_col=0)  # 需要包含 time/event 列
+
+    同时做 X/y 的索引对齐：
+      - 若二者 index 有交集，取交集并按同一顺序对齐
+      - 若 index 缺失或不一致，则退化为仅检查长度一致
+
+    这样可减少“X 与 y 样本顺序不一致”导致的隐性错误。
+    """
+
+    def __init__(self, x_path: str, y_path: str, dtype=np.float32) -> None:
+        x_df = pd.read_csv(x_path, index_col=0)
+        y_df = pd.read_csv(y_path, index_col=0)
+
+        # 基本列检查
+        for col in ("time", "event"):
+            if col not in y_df.columns:
+                raise ValueError(f"y.csv 必须包含列: '{col}'，但未找到。")
+
+        # 尝试用 index 对齐
+        if x_df.index.equals(y_df.index):
+            aligned_x = x_df
+            aligned_y = y_df
+        else:
+            common = x_df.index.intersection(y_df.index)
+            if len(common) > 0:
+                aligned_x = x_df.loc[common]
+                aligned_y = y_df.loc[common]
+            else:
+                # 退化：仅检查长度
+                if len(x_df) != len(y_df):
+                    raise ValueError(
+                        f"X/y 样本数不一致：X={len(x_df)}，y={len(y_df)}。"
+                        "请检查两个文件是否对应同一批样本。"
+                    )
+                aligned_x = x_df
+                aligned_y = y_df
+
+        self.ids = aligned_y.index.astype(str).tolist()
+        self.x = torch.tensor(aligned_x.values.astype(dtype), dtype=torch.float32)
+        self.time = torch.tensor(aligned_y["time"].values.astype(dtype), dtype=torch.float32)
+        self.event = torch.tensor(aligned_y["event"].values.astype(dtype), dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, idx: int):
+        return self.x[idx], self.time[idx], self.event[idx]
+
+
+# -------------------------
+# 4) 训练与评估
+# -------------------------
+@dataclass
+class TrainConfig:
+    hidden_sizes: Tuple[int, ...] = (128, 64)
+    dropout: float = 0.5
+    lr: float = 1e-4
+    weight_decay: float = 1e-1
+    epochs: int = 500
+    batch_size: int = 128
+    split_ratio: float = 0.8  # 仅在未提供 val set 时使用
+    patience: int = 60        # early stopping
+    device: str = "auto"
+    seed: int = 63
+    num_workers: int = 0
+
+
+@torch.no_grad()
+def predict_risk(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    model.eval()
+    risks, times, events = [], [], []
+    for x, t, e in loader:
+        x = x.to(device)
+        r = model(x).detach().cpu().numpy()
+        risks.append(r)
+        times.append(t.numpy())
+        events.append(e.numpy())
+    risk = np.concatenate(risks)
+    time = np.concatenate(times)
+    event = np.concatenate(events)
+    return risk, time, event
+
+
+def train_deepsurv(
+    train_x: str,
+    train_y: str,
+    out_dir: str,
+    cfg: TrainConfig,
+    val_x: Optional[str] = None,
+    val_y: Optional[str] = None,
+) -> Path:
+    """
+    训练 DeepSurv，并保存验证集 C-index 最优的权重到 out_dir/best_deepsurv.pth。
+    """
+    set_seed(cfg.seed)
+    outp = ensure_dir(out_dir)
+    device = _as_device(cfg.device)
+
+    # --- 数据集 ---
+    full_train = SurvivalDataset(train_x, train_y)
+
+    if val_x is not None and val_y is not None:
+        train_ds = full_train
+        val_ds = SurvivalDataset(val_x, val_y)
+    else:
+        # 沿用你原脚本：从一个队列中按比例划分 train/val
+        n_train = int(cfg.split_ratio * len(full_train))
+        n_val = len(full_train) - n_train
+        if n_train <= 1 or n_val <= 1:
+            raise ValueError(
+                f"split_ratio={cfg.split_ratio} 导致 train/val 样本太少："
+                f"train={n_train}, val={n_val}。请调整 split_ratio 或提供独立验证集。"
+            )
+        train_ds, val_ds = random_split(
+            full_train,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(cfg.seed),
+        )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=1024, shuffle=False, num_workers=cfg.num_workers
+    )
+
+    # --- 模型 ---
+    feat_dim = full_train.x.shape[1]
+    model = DeepSurvMLP(
+        num_features=feat_dim,
+        hidden_sizes=cfg.hidden_sizes,
+        dropout=cfg.dropout,
+    ).to(device)
+    optim = torch.optim.Adam(
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    # --- 日志 ---
+    log_csv = outp / "train_log.csv"
+    with log_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_cindex", "best"])
+
+    best_c = -np.inf
+    best_path = outp / "best_deepsurv.pth"
+    bad_epochs = 0
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        loss_sum = 0.0
+
+        for x, t, e in train_loader:
+            x, t, e = x.to(device), t.to(device), e.to(device)
+            risk = model(x)
+            loss = cox_ph_loss(risk, t, e)
+
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+
+            loss_sum += float(loss.item())
+
+        train_loss = loss_sum / max(1, len(train_loader))
+
+        # --- 验证：C-index ---
+        risk_val, time_val, event_val = predict_risk(model, val_loader, device)
+        # 注意：与原脚本一致，用 -risk 计算 C-index（风险越高 -> 越早发生事件）
+        c_val = float(concordance_index(time_val, -risk_val, event_val))
+
+        is_best = c_val > best_c
+        if is_best:
+            best_c = c_val
+            bad_epochs = 0
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "feat_dim": feat_dim,
+                    "hidden_sizes": cfg.hidden_sizes,
+                    "dropout": cfg.dropout,
+                    "seed": cfg.seed,
+                },
+                best_path,
+            )
+        else:
+            bad_epochs += 1
+
+        with log_csv.open("a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, f"{train_loss:.6f}", f"{c_val:.6f}", int(is_best)])
+
+        print(
+            f"[{epoch:03d}/{cfg.epochs}] loss={train_loss:.4f} "
+            f"val_C-index={c_val:.4f} best={best_c:.4f} "
+            f"(patience {bad_epochs}/{cfg.patience})"
+        )
+
+        # early stopping
+        if bad_epochs >= cfg.patience:
+            print(f"Early stopping triggered. Best val C-index = {best_c:.4f}")
+            break
+
+    print(f"✅ Done. Best model saved to: {best_path} (val C-index={best_c:.4f})")
+    return best_path
+
+
+def evaluate_deepsurv(
+    model_path: str,
+    x_csv: str,
+    y_csv: str,
+    out_csv: Optional[str] = None,
+    device: str = "auto",
+) -> float:
+    """
+    加载训练好的 DeepSurv，在给定队列上输出 risk_score 与 C-index。
+
+    返回：该队列的 C-index
+    """
+    dev = _as_device(device)
+    ckpt = torch.load(model_path, map_location=dev)
+
+    ds = SurvivalDataset(x_csv, y_csv)
+    feat_dim = ds.x.shape[1]
+
+    # 兼容：若 ckpt 是 dict 并包含 state_dict，则按此加载；否则认为是纯 state_dict
+    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+
+    # 优先使用 checkpoint 中记录的结构；若缺失则使用默认结构
+    hidden_sizes = tuple(ckpt.get("hidden_sizes", (128, 64))) if isinstance(ckpt, dict) else (128, 64)
+    dropout = float(ckpt.get("dropout", 0.5)) if isinstance(ckpt, dict) else 0.5
+
+    model = DeepSurvMLP(
+        num_features=feat_dim, hidden_sizes=hidden_sizes, dropout=dropout
+    ).to(dev)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    loader = DataLoader(ds, batch_size=1024, shuffle=False, num_workers=0)
+    risk, time, event = predict_risk(model, loader, dev)
+    cidx = float(concordance_index(time, -risk, event))
+
+    print(f"C-index = {cidx:.4f}")
+
+    if out_csv is not None:
+        ydf = pd.read_csv(y_csv, index_col=0)
+        # 对齐后可能发生取交集，确保输出与 dataset 的顺序一致：
+        ydf = ydf.loc[ds.ids]
+        ydf_out = ydf.copy()
+        ydf_out["risk_score"] = risk
+        Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+        ydf_out.to_csv(out_csv)
+        print(f"✅ Predictions saved to: {out_csv}")
+
+    return cidx
+
+
+# -------------------------
+# 5) CLI
+# -------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # ---- train ----
+    p_tr = sub.add_parser("train", help="训练 DeepSurv 并保存最优模型")
+    p_tr.add_argument("--train-x", required=True, help="训练集特征 CSV")
+    p_tr.add_argument("--train-y", required=True, help="训练集生存 CSV（含 time/event）")
+    p_tr.add_argument("--val-x", default=None, help="验证集特征 CSV（可选）")
+    p_tr.add_argument("--val-y", default=None, help="验证集生存 CSV（可选）")
+    p_tr.add_argument("--out-dir", required=True, help="输出目录（保存模型与日志）")
+
+    p_tr.add_argument("--hidden-sizes", nargs="+", type=int, default=[128, 64], help="MLP hidden sizes")
+    p_tr.add_argument("--dropout", type=float, default=0.5)
+    p_tr.add_argument("--lr", type=float, default=1e-4)
+    p_tr.add_argument("--weight-decay", type=float, default=1e-1)
+    p_tr.add_argument("--epochs", type=int, default=500)
+    p_tr.add_argument("--batch-size", type=int, default=128)
+    p_tr.add_argument("--split-ratio", type=float, default=0.8, help="未提供 val set 时的随机划分比例")
+    p_tr.add_argument("--patience", type=int, default=60, help="early stopping patience")
+    p_tr.add_argument("--device", type=str, default="auto", help="auto/cuda/cpu/cuda:0 ...")
+    p_tr.add_argument("--seed", type=int, default=63)
+
+    # ---- predict ----
+    p_pr = sub.add_parser("predict", help="加载模型并计算 risk_score 与 C-index")
+    p_pr.add_argument("--model", required=True, help="训练得到的 best_deepsurv.pth")
+    p_pr.add_argument("--x", required=True, help="特征 CSV")
+    p_pr.add_argument("--y", required=True, help="生存 CSV（含 time/event）")
+    p_pr.add_argument("--out-csv", default=None, help="输出 CSV（可选）")
+    p_pr.add_argument("--device", type=str, default="auto")
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.cmd == "train":
+        cfg = TrainConfig(
+            hidden_sizes=tuple(args.hidden_sizes),
+            dropout=float(args.dropout),
+            lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
+            epochs=int(args.epochs),
+            batch_size=int(args.batch_size),
+            split_ratio=float(args.split_ratio),
+            patience=int(args.patience),
+            device=str(args.device),
+            seed=int(args.seed),
+        )
+
+        val_x = args.val_x if args.val_x not in (None, "", "None") else None
+        val_y = args.val_y if args.val_y not in (None, "", "None") else None
+
+        if (val_x is None) ^ (val_y is None):
+            raise ValueError("val-x 与 val-y 必须同时提供，或都不提供。")
+
+        train_deepsurv(
+            train_x=args.train_x,
+            train_y=args.train_y,
+            val_x=val_x,
+            val_y=val_y,
+            out_dir=args.out_dir,
+            cfg=cfg,
+        )
+
+    elif args.cmd == "predict":
+        evaluate_deepsurv(
+            model_path=args.model,
+            x_csv=args.x,
+            y_csv=args.y,
+            out_csv=args.out_csv,
+            device=args.device,
+        )
+
+
+if __name__ == "__main__":
+    main()
