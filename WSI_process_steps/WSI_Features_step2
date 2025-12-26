@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Export Trident slide-level HDF5 features to an Excel file.
+
+What it does:
+- Scans a directory for .h5 / .hdf5 files
+- Reads dataset "features" from each file
+- Writes each slide's feature vector into an Excel sheet
+
+Typical input directory example:
+  /openbayes/input/input0/out_seg_sd_supp/20x_256px_0px_overlap/slide_features_titan/
+
+Install dependencies:
+  pip install h5py pandas openpyxl
+
+Usage:
+  python export_h5_features_to_excel.py \
+    --input_dir /path/to/slide_features_titan \
+    --output revised_output_sd1.xlsx
+
+Notes:
+- If a file is corrupted or missing the "features" dataset, it will be skipped and logged.
+- Excel has a row limit of 1,048,576. If you have more features than this, prefer CSV.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import h5py
+import pandas as pd
+
+
+def list_h5_files(input_dir: Path) -> List[Path]:
+    """List .h5/.hdf5 files under input_dir (non-recursive)."""
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+    if not input_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
+
+    files = []
+    for p in sorted(input_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in [".h5", ".hdf5"]:
+            files.append(p)
+    return files
+
+
+def read_features_from_h5(h5_path: Path, dataset_name: str = "features") -> List[float]:
+    """
+    Read dataset from a single H5 file and return as a 1D Python list.
+
+    Handles:
+    - features stored as (D,) or (1, D) or (N, D) (we flatten it)
+    """
+    with h5py.File(str(h5_path), "r") as hf:
+        if dataset_name not in hf:
+            raise KeyError(f'Dataset "{dataset_name}" not found in {h5_path.name}')
+        data = hf[dataset_name][...]
+        # Flatten to 1D vector (common for feature vectors)
+        return data.reshape(-1).astype("float32").tolist()
+
+
+def export_directory_to_excel(
+    input_dir: Path,
+    output_path: Path,
+    dataset_name: str = "features",
+) -> Tuple[int, int]:
+    """
+    Read all H5 feature files in input_dir and export to an Excel file.
+
+    Returns:
+      (n_success, n_failed)
+    """
+    h5_files = list_h5_files(input_dir)
+    if not h5_files:
+        raise RuntimeError(f"No .h5/.hdf5 files found in: {input_dir}")
+
+    # Store as dict: {filename: [feature_vector]}
+    # This matches your original "dirt" structure, just with cleaner naming.
+    features_dict: Dict[str, List[float]] = {}
+
+    n_failed = 0
+    for h5_path in h5_files:
+        try:
+            feats = read_features_from_h5(h5_path, dataset_name=dataset_name)
+            features_dict[h5_path.name] = feats
+        except Exception as e:
+            n_failed += 1
+            print(f"[SKIP] {h5_path.name} -> {type(e).__name__}: {e}")
+
+    if not features_dict:
+        raise RuntimeError("No valid feature files were read. Nothing to export.")
+
+    # Create DataFrame
+    # Each column = one slide file, each row = one feature dimension
+    df = pd.DataFrame(features_dict)
+
+    # Write to Excel
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(output_path, index=False)
+
+    print(f"[OK] Saved Excel: {output_path}")
+    print(f"[INFO] Slides exported: {len(features_dict)} | Failed: {n_failed} | Rows(features): {df.shape[0]}")
+    return len(features_dict), n_failed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export HDF5 slide features (dataset 'features') to an Excel file."
+    )
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Directory containing .h5/.hdf5 feature files.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="revised_output.xlsx",
+        help="Output Excel filename (default: revised_output.xlsx).",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="features",
+        help='HDF5 dataset name to read (default: "features").',
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+
+    export_directory_to_excel(
+        input_dir=input_dir,
+        output_path=output_path,
+        dataset_name=args.dataset_name,
+    )
+
+
+if __name__ == "__main__":
+    main()
