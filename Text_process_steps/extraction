@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Extract text features from pathology/clinical text using Bio_ClinicalBERT.
+
+What this script does
+---------------------
+1) Loads tokenizer + model: emilyalsentzer/Bio_ClinicalBERT
+2) Reads an Excel file (.xls / .xlsx) and extracts texts from a specified column
+3) Encodes each text into a fixed-length feature vector using a pooling strategy:
+   - "cls"  : [CLS] embedding (default, most common)
+   - "mean" : mean pooling over non-padding tokens
+   - "max"  : max pooling over non-padding tokens
+4) Saves extracted features to an Excel file
+
+Install dependencies (recommended outside the script)
+-----------------------------------------------------
+pip install "transformers==4.30.2" torch pandas openpyxl xlrd==2.0.1
+
+Notes
+-----
+- For legacy .xls reading, xlrd>=2.0.1 only supports .xls (not .xlsx).
+- If your input is .xlsx, you can skip xlrd and use pandas.read_excel directly.
+- Hugging Face model download requires internet access in your runtime.
+
+Example usage
+-------------
+python extract_text_features_clinicalbert.py \
+  --input /openbayes/home/sd_path_features.xls \
+  --sheet 0 \
+  --text_col 1 \
+  --skip_header \
+  --pooling cls \
+  --output /openbayes/home/output/sd_revised_pathology_features.xlsx
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import List
+
+import pandas as pd
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extract Bio_ClinicalBERT features from medical/pathology texts in Excel."
+    )
+    parser.add_argument("--input", type=str, required=True, help="Input Excel file path (.xls/.xlsx).")
+    parser.add_argument("--sheet", type=int, default=0, help="Sheet index (default: 0).")
+    parser.add_argument("--text_col", type=int, default=1, help="0-based column index for texts (default: 1).")
+    parser.add_argument(
+        "--skip_header",
+        action="store_true",
+        help="If set, skips the first row in the text column (common when the first row is a header).",
+    )
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default="cls",
+        choices=["cls", "mean", "max"],
+        help="Pooling strategy: cls | mean | max (default: cls).",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="emilyalsentzer/Bio_ClinicalBERT",
+        help='Hugging Face model name (default: "emilyalsentzer/Bio_ClinicalBERT").',
+    )
+    parser.add_argument("--max_length", type=int, default=512, help="Max token length (default: 512).")
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Output Excel path (.xlsx recommended).",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size for encoding (default: 1). Set >1 if GPU memory allows.",
+    )
+    return parser.parse_args()
+
+
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+@torch.no_grad()
+def extract_features_batch(
+    texts: List[str],
+    tokenizer: AutoTokenizer,
+    model: AutoModel,
+    device: torch.device,
+    pooling: str = "cls",
+    max_length: int = 512,
+) -> torch.Tensor:
+    """
+    Encode a batch of texts and return feature vectors.
+
+    Returns:
+        Tensor of shape [B, H] where H is hidden size (e.g., 768).
+    """
+    inputs = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    outputs = model(**inputs)
+    last_hidden = outputs.last_hidden_state  # [B, T, H]
+
+    if pooling == "cls":
+        feats = last_hidden[:, 0, :]  # [B, H]
+    elif pooling == "mean":
+        attn = inputs["attention_mask"]  # [B, T]
+        attn_f = attn.unsqueeze(-1).float()  # [B, T, 1]
+        feats = (last_hidden * attn_f).sum(dim=1) / attn_f.sum(dim=1).clamp(min=1e-6)
+    elif pooling == "max":
+        attn = inputs["attention_mask"]  # [B, T]
+        # mask padding tokens with a large negative number so they won't be selected in max
+        masked = last_hidden.masked_fill(attn.unsqueeze(-1) == 0, -1e9)
+        feats = masked.max(dim=1).values
+    else:
+        raise ValueError("Unsupported pooling. Choose from: cls, mean, max.")
+
+    return feats.detach().cpu()
+
+
+def read_texts_from_excel(
+    input_path: Path,
+    sheet_idx: int,
+    text_col: int,
+    skip_header: bool,
+) -> List[str]:
+    """
+    Read texts from Excel using pandas (works for .xls and .xlsx in most environments).
+
+    If you must rely on xlrd for .xls only, pandas will often still work as long as
+    xlrd is installed. Otherwise install 'xlrd==2.0.1'.
+    """
+    df = pd.read_excel(input_path, sheet_name=sheet_idx, header=None)
+    col = df.iloc[:, text_col].astype(str).tolist()
+
+    if skip_header and len(col) > 0:
+        col = col[1:]
+
+    # Clean: remove empty/NaN-like strings
+    texts = []
+    for t in col:
+        t2 = (t or "").strip()
+        if t2 and t2.lower() not in ["nan", "none"]:
+            texts.append(t2)
+        else:
+            texts.append("")  # keep alignment with rows (optional)
+    return texts
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+
+    # 1) Load model/tokenizer
+    print(f"[INFO] Loading tokenizer/model: {args.model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = AutoModel.from_pretrained(args.model_name)
+
+    device = get_device()
+    model = model.to(device)
+    model.eval()
+    print(f"[INFO] Device: {device}")
+
+    # 2) Read texts
+    print(f"[INFO] Reading Excel: {input_path}")
+    texts = read_texts_from_excel(
+        input_path=input_path,
+        sheet_idx=args.sheet,
+        text_col=args.text_col,
+        skip_header=args.skip_header,
+    )
+    print(f"[INFO] Total rows read: {len(texts)}")
+
+    # 3) Encode texts
+    features_all = []
+    bs = max(1, int(args.batch_size))
+
+    print(f"[INFO] Extracting features (pooling={args.pooling}, batch_size={bs}) ...")
+    for start in range(0, len(texts), bs):
+        batch_texts = texts[start : start + bs]
+
+        # Optional: replace empty strings with a single space to avoid tokenizer edge cases
+        batch_texts = [t if t.strip() else " " for t in batch_texts]
+
+        feats = extract_features_batch(
+            texts=batch_texts,
+            tokenizer=tokenizer,
+            model=model,
+            device=device,
+            pooling=args.pooling,
+            max_length=args.max_length,
+        )  # [B, H]
+        features_all.append(feats)
+
+        if (start // bs) % 50 == 0:
+            print(f"  - processed {min(start + bs, len(texts))}/{len(texts)}")
+
+    features_tensor = torch.cat(features_all, dim=0)  # [N, H]
+    print(f"[INFO] Feature shape: {tuple(features_tensor.shape)}")
+
+    # 4) Save to Excel
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df_out = pd.DataFrame(features_tensor.numpy())
+    # If you want 1-based index in Excel (like your original code), keep index=True.
+    df_out.to_excel(output_path, index=True, engine="openpyxl")
+
+    print(f"[OK] Saved features to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
