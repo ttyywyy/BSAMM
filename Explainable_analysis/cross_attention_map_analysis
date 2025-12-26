@@ -1,0 +1,420 @@
+# -*- coding: utf-8 -*-
+"""
+extract_crossmodal_attention_and_sanitychecks_v2_save_csv.py
+
+新增：
+- 输出 attn_mean_layer1.csv：与 attn_mean_layer1.png 完全一致的数据（4x4）
+- 若 event/censor 都存在，也输出分组平均 csv：
+  attn_event_layer1_mean.csv, attn_censor_layer1_mean.csv
+
+说明（为上传 GitHub 做的“隐私脱敏”改动）：
+- 删除本地绝对路径，改为命令行参数：--data_dir_test / --model_path / --out_dir
+- 其余核心逻辑保持不变（模型结构、attention 提取、sanity checks、输出文件名不变）
+"""
+
+import os
+import math
+import random
+import argparse
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import matplotlib
+matplotlib.use("Agg")  # 无界面后端，适合服务器/批处理
+import matplotlib.pyplot as plt
+from lifelines.utils import concordance_index
+
+
+# =========================
+# 1) 复现性
+# =========================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# =========================
+# 2) Cox-PH loss
+# =========================
+def cox_ph_loss(risk, time, event, eps=1e-8):
+    risk, time, event = [x.view(-1) for x in (risk, time, event)]
+    idx = torch.argsort(time, descending=True)
+    risk = risk[idx]
+    event = event[idx]
+    log_c = torch.logcumsumexp(risk, 0)
+    return -(event * (risk - log_c)).sum() / (event.sum() + eps)
+
+
+# =========================
+# 3) 模型结构（与 checkpoint 匹配：保留 attention2）
+# =========================
+class ModalityEncoder(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, out_dim, bias=False),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
+class self_att(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.query_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.key_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.value_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+
+    def forward(self, x, return_attn=False, force_identity=False):
+        Q = self.query_proj(x)
+        K = self.key_proj(x)
+        V = self.value_proj(x)
+
+        score = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.hidden_dim)  # (B,4,4)
+        attn = torch.softmax(score, dim=-1)
+
+        if force_identity:
+            B, T, _ = attn.shape
+            attn = torch.eye(T, device=attn.device).unsqueeze(0).repeat(B, 1, 1)
+
+        out = torch.matmul(attn, V)
+
+        if return_attn:
+            return out, attn
+        return out
+
+
+class Surv_attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.MRI = ModalityEncoder(1342, 768)
+        self.attention1 = self_att(768, 256)
+        self.attention2 = self_att(256, 256)  # 必须存在以匹配 state_dict
+        self.ln = nn.LayerNorm(256, eps=1e-5, elementwise_affine=True)
+        self.for_head = nn.Sequential(
+            nn.Linear(1024, 32, bias=False),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, mri, wsi, ich, text, return_attn=False, force_identity=False):
+        MRI_feat = self.MRI(mri)  # (B,768)
+        combined = torch.stack([MRI_feat, wsi, ich, text], dim=1)  # (B,4,768)
+
+        if return_attn:
+            z1, a1 = self.attention1(combined, return_attn=True, force_identity=force_identity)
+        else:
+            z1 = self.attention1(combined, return_attn=False, force_identity=force_identity)
+            a1 = None
+
+        # 与你原始评估脚本一致：attention2 不参与 forward（如训练时确实没用它）
+        # z2 = self.attention2(z1)
+
+        z3 = self.ln(z1).flatten(1)  # (B,1024)
+        risk = self.for_head(z3)     # (B,1)
+
+        if return_attn:
+            return risk, a1
+        return risk
+
+
+# =========================
+# 4) Dataset
+# =========================
+class MultimodalDataset(Dataset):
+    def __init__(self, mri_df, wsi_df, ich_df, text_df, surv_df):
+        self.mri = torch.tensor(mri_df.values, dtype=torch.float32)
+        self.wsi = torch.tensor(wsi_df.values, dtype=torch.float32)
+        self.ich = torch.tensor(ich_df.values, dtype=torch.float32)
+        self.text = torch.tensor(text_df.values, dtype=torch.float32)
+        self.time = torch.tensor(surv_df["time"].values, dtype=torch.float32)
+        self.event = torch.tensor(surv_df["event"].values, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.time)
+
+    def __getitem__(self, idx):
+        return (
+            self.mri[idx], self.wsi[idx], self.ich[idx], self.text[idx],
+            self.time[idx], self.event[idx]
+        )
+
+
+# =========================
+# 5) 可视化与保存
+# =========================
+def plot_heatmap(mat4x4, title, save_path, labels):
+    fig, ax = plt.subplots(figsize=(5.2, 4.2))
+    im = ax.imshow(mat4x4, vmin=0, vmax=1)
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    ax.set_title(title)
+
+    for i in range(mat4x4.shape[0]):
+        for j in range(mat4x4.shape[1]):
+            ax.text(j, i, f"{mat4x4[i, j]:.2f}", ha="center", va="center", fontsize=9)
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+
+def save_matrix_csv(mat4x4, labels, csv_path):
+    """
+    将 4x4 矩阵保存为带行列名的 csv。
+    行：query 模态（qMRI/qWSI/qIHC/qClinical）
+    列：key 模态（kMRI/kWSI/kIHC/kClinical）
+    """
+    df = pd.DataFrame(
+        mat4x4,
+        index=[f"q{l}" for l in labels],
+        columns=[f"k{l}" for l in labels]
+    )
+    df.to_csv(csv_path, encoding="utf-8-sig")
+
+
+def flatten_attn(attns, labels):
+    cols = [f"q{qi}_to_k{kj}" for qi in labels for kj in labels]
+    flat = attns.reshape(attns.shape[0], -1)
+    return pd.DataFrame(flat, columns=cols)
+
+
+@torch.no_grad()
+def run_inference(model, dl, device, return_attn=False, force_identity=False):
+    model.eval()
+    risks, times, events, attns = [], [], [], []
+
+    for mri_b, wsi_b, ich_b, txt_b, t_b, e_b in dl:
+        mri_b = mri_b.to(device)
+        wsi_b = wsi_b.to(device)
+        ich_b = ich_b.to(device)
+        txt_b = txt_b.to(device)
+
+        if return_attn:
+            r, a1 = model(mri_b, wsi_b, ich_b, txt_b, return_attn=True, force_identity=force_identity)
+            attns.append(a1.detach().cpu().numpy())
+        else:
+            r = model(mri_b, wsi_b, ich_b, txt_b, return_attn=False, force_identity=force_identity)
+
+        risks.append(r.detach().cpu().numpy())
+        times.append(t_b.numpy())
+        events.append(e_b.numpy())
+
+    risks = np.concatenate(risks, axis=0).reshape(-1)
+    times = np.concatenate(times, axis=0).reshape(-1)
+    events = np.concatenate(events, axis=0).reshape(-1)
+
+    cidx = concordance_index(times, -risks, events)
+    loss = cox_ph_loss(torch.tensor(risks), torch.tensor(times), torch.tensor(events)).item()
+
+    if return_attn:
+        attns = np.concatenate(attns, axis=0)  # (N,4,4)
+        return risks, times, events, cidx, loss, attns
+    return risks, times, events, cidx, loss, None
+
+
+# =========================
+# 6) 参数
+# =========================
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir_test", type=str, default="./data/test",
+                        help="Directory containing MRI_features.xlsx / wsi_features.xlsx / ich_features.xlsx / Clinical_features.xlsx / PFS_survival.xlsx")
+    parser.add_argument("--model_path", type=str, default="./checkpoints/best_model.pth",
+                        help="Path to model checkpoint (.pth)")
+    parser.add_argument("--out_dir", type=str, default="./outputs/attn_viz",
+                        help="Output directory")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
+    parser.add_argument("--shuffle_seed", type=int, default=42, help="Seed for shuffle sanity-check")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    labels = ["MRI", "WSI", "IHC", "Clinical"]
+
+    # ---------- 文件路径 ----------
+    mri_path = os.path.join(args.data_dir_test, "MRI_features.xlsx")
+    wsi_path = os.path.join(args.data_dir_test, "wsi_features.xlsx")
+    ich_path = os.path.join(args.data_dir_test, "ich_features.xlsx")
+    text_path = os.path.join(args.data_dir_test, "Clinical_features.xlsx")
+    surv_path = os.path.join(args.data_dir_test, "PFS_survival.xlsx")
+
+    # ---------- 读取数据 ----------
+    for p in [mri_path, wsi_path, ich_path, text_path, surv_path]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"找不到文件: {p}")
+
+    mri = pd.read_excel(mri_path, index_col=0)
+    wsi = pd.read_excel(wsi_path, index_col=0)
+    ich = pd.read_excel(ich_path, index_col=0)
+    text = pd.read_excel(text_path, index_col=0)
+    surv = pd.read_excel(surv_path, index_col=0)
+
+    # ---------- 对齐 index ----------
+    common = (
+        mri.index
+        .intersection(wsi.index)
+        .intersection(ich.index)
+        .intersection(text.index)
+        .intersection(surv.index)
+    )
+    if len(common) == 0:
+        raise RuntimeError("四个模态与生存表的 index 没有交集，请检查病人ID/index 是否一致。")
+
+    mri = mri.loc[common]
+    wsi = wsi.loc[common]
+    ich = ich.loc[common]
+    text = text.loc[common]
+    surv = surv.loc[common]
+
+    ds = MultimodalDataset(mri, wsi, ich, text, surv)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+
+    # ---------- 加载模型 ----------
+    model = Surv_attention().to(device)
+    state = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    print("✔ Loaded checkpoint")
+    print(f"✔ N={len(ds)}")
+
+    # =========================
+    # (1) Full model：提取 attention1
+    # =========================
+    risks, times, events, cidx, loss, attns = run_inference(
+        model, dl, device, return_attn=True, force_identity=False
+    )
+    print(f"[FULL] C-index={cidx:.4f} | CoxLoss={loss:.4f}")
+
+    # 保存每病人 attention（xlsx）
+    df_attn = flatten_attn(attns, labels)
+    df_attn.insert(0, "patient_id", common.astype(str))
+    df_attn.insert(1, "risk", risks)
+    df_attn.insert(2, "time", times)
+    df_attn.insert(3, "event", events)
+    df_attn.to_excel(os.path.join(args.out_dir, "attention_per_patient.xlsx"), index=False)
+
+    # ======== 用于 attn_mean_layer1.png 的数据（队列平均）========
+    A_mean = attns.mean(axis=0)  # (4,4)
+
+    # 输出 CSV（你要求的）
+    save_matrix_csv(A_mean, labels, os.path.join(args.out_dir, "attn_mean_layer1.csv"))
+
+    # 画热图
+    plot_heatmap(
+        A_mean,
+        "Cohort-averaged cross-modal attention (Layer1)",
+        os.path.join(args.out_dir, "attn_mean_layer1.png"),
+        labels
+    )
+
+    # Event vs Censor 平均（可选输出 csv）
+    ev = events.astype(int) == 1
+    if ev.sum() > 0 and (~ev).sum() > 0:
+        A_event = attns[ev].mean(axis=0)
+        A_censor = attns[~ev].mean(axis=0)
+
+        save_matrix_csv(A_event, labels, os.path.join(args.out_dir, "attn_event_layer1_mean.csv"))
+        save_matrix_csv(A_censor, labels, os.path.join(args.out_dir, "attn_censor_layer1_mean.csv"))
+
+        plot_heatmap(A_event, "Attention (Event=1) (Layer1)",
+                     os.path.join(args.out_dir, "attn_event_layer1.png"), labels)
+        plot_heatmap(A_censor, "Attention (Event=0) (Layer1)",
+                     os.path.join(args.out_dir, "attn_censor_layer1.png"), labels)
+    else:
+        print("[提示] event 全为 0 或全为 1，无法分组输出 event/censor 平均热图与 csv。")
+
+    # Cross-modal strength 直方图：offdiag_mean / diag_mean
+    diag_mean = np.trace(attns, axis1=1, axis2=2) / 4.0
+    off_mean = (attns.sum(axis=(1, 2)) - np.trace(attns, axis1=1, axis2=2)) / (4 * 3.0)
+    ratio = off_mean / (diag_mean + 1e-8)
+
+    plt.figure(figsize=(5, 4))
+    plt.hist(ratio, bins=30)
+    plt.title("Cross-modal strength = offdiag_mean / diag_mean")
+    plt.xlabel("ratio")
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.out_dir, "crossmodal_strength_hist.png"), dpi=300)
+    plt.close()
+
+    # =========================
+    # (2) Sanity check A：Diagonal-only（禁止跨模态混合）
+    # =========================
+    _, _, _, cidx_id, loss_id, _ = run_inference(
+        model, dl, device, return_attn=False, force_identity=True
+    )
+    print(f"[DIAGONAL-ONLY] C-index={cidx_id:.4f} | CoxLoss={loss_id:.4f}")
+
+    # =========================
+    # (3) Sanity check B：Shuffle（破坏跨模态对齐）
+    # =========================
+    def eval_shuffle(which="wsi", seed=42):
+        rng = np.random.RandomState(seed)
+        perm = np.arange(len(common))
+        rng.shuffle(perm)
+
+        mri_s = mri.copy()
+        wsi_s = wsi.copy()
+        ich_s = ich.copy()
+        text_s = text.copy()
+
+        if which == "mri":
+            mri_s.iloc[:] = mri_s.iloc[perm].values
+        elif which == "wsi":
+            wsi_s.iloc[:] = wsi_s.iloc[perm].values
+        elif which == "ich":
+            ich_s.iloc[:] = ich_s.iloc[perm].values
+        elif which == "text":
+            text_s.iloc[:] = text_s.iloc[perm].values
+        else:
+            raise ValueError("which must be one of: mri/wsi/ich/text")
+
+        ds_s = MultimodalDataset(mri_s, wsi_s, ich_s, text_s, surv)
+        dl_s = DataLoader(ds_s, batch_size=args.batch_size, shuffle=False)
+        _, _, _, cidx_s, loss_s, _ = run_inference(model, dl_s, device, return_attn=False, force_identity=False)
+        return cidx_s, loss_s
+
+    shuffle_rows = []
+    for which in ["mri", "wsi", "ich", "text"]:
+        cidx_s, loss_s = eval_shuffle(which=which, seed=args.shuffle_seed)
+        print(f"[SHUFFLE {which.upper()}] C-index={cidx_s:.4f} | CoxLoss={loss_s:.4f}")
+        shuffle_rows.append([f"shuffle_{which}", cidx_s, loss_s])
+
+    sanity = pd.DataFrame(
+        [["full", cidx, loss],
+         ["diagonal_only", cidx_id, loss_id]] + shuffle_rows,
+        columns=["setting", "c_index", "cox_loss"]
+    )
+    sanity.to_excel(os.path.join(args.out_dir, "sanity_check_results.xlsx"), index=False)
+
+    print("\n✅ Done. Outputs saved to:", args.out_dir)
+    print(" - attn_mean_layer1.csv  (用于 attn_mean_layer1.png 的数据)")
+    print(" - attn_mean_layer1.png")
+    print(" - attention_per_patient.xlsx")
+    print(" - sanity_check_results.xlsx")
+
+
+if __name__ == "__main__":
+    main()
