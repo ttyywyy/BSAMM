@@ -1,0 +1,644 @@
+# ============================================================
+# R Visualization Utilities (De-identified & Organized)
+# ------------------------------------------------------------
+# Purpose:
+#   1) Coverage heatmap (0/1 presence across modalities)
+#   2) Kaplan–Meier curves (+ log-rank p)
+#   3) Time-dependent ROC (AUC + 95% CI; optional AUC p-value)
+#   4) DCA curves (ggDCA / dcurves)
+#   5) Confusion matrix at a time horizon (count + %)
+#   6) Calibration curves (rms::calibrate)
+#   7) Forest plots (forestplot)
+#   8) Modality contribution (pie / bar)
+#   9) Radar chart (fmsb)
+#  10) Cross-modal attention heatmap (pheatmap / ComplexHeatmap)
+#
+# Privacy / De-identification:
+#   - All local absolute paths and dataset-specific filenames are removed.
+#   - Use relative paths or user-defined variables (DATA_DIR / OUT_DIR).
+#   - Patient identifiers are only used as generic "ID" or "P001" style.
+#
+# Notes:
+#   - This file is meant as a template. Replace placeholders with your data.
+#   - Keep variable naming consistent: time, event, risk_score, risk_group
+# ============================================================
+
+# ------------------------------
+# 0) Global settings & packages
+# ------------------------------
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survival)
+  library(survminer)
+  library(timeROC)
+  library(survcomp)
+  library(rms)
+  library(dcurves)
+  library(ggDCA)
+  library(ggsci)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(forestplot)
+  library(grid)
+  library(ggplotify)
+  library(cowplot)
+  library(fmsb)
+  library(scales)
+})
+
+# (Optional) set a global theme
+theme_set(theme_classic(base_size = 14))
+
+# De-identified working directories
+DATA_DIR <- "./data"     # <- change if needed
+OUT_DIR  <- "./outputs"  # <- change if needed
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ============================
+# 1) Coverage heatmap (0/1)
+# ============================
+
+# ---- Example simulated wide table (each row=patient, each column=modality) ----
+simulate_coverage_data <- function(n_patients = 30, seed = 2025) {
+  set.seed(seed)
+  patients <- sprintf("P%03d", 1:n_patients)
+  modalities <- c(
+    "Whole genome seq",
+    "Bulk RNA seq",
+    "Single nucleus RNA seq",
+    "Spatial transcriptome seq",
+    "Primary cell culture"
+  )
+  probs <- c(0.78, 0.70, 0.12, 0.06, 0.22)
+
+  mat <- sapply(probs, function(p) rbinom(length(patients), 1, p))
+  colnames(mat) <- modalities
+  rownames(mat) <- patients
+
+  df_wide <- data.frame(ID = patients, mat, check.names = FALSE)
+  list(df_wide = df_wide, modalities = modalities)
+}
+
+# ---- Wide -> Long ----
+wide_to_long <- function(df_wide, modalities, id_col = "ID") {
+  df_wide %>%
+    pivot_longer(
+      cols = all_of(modalities),
+      names_to = "modality",
+      values_to = "present"
+    ) %>%
+    mutate(
+      modality = factor(modality, levels = modalities),
+      present  = as.integer(present)
+    )
+}
+
+# ---- Coverage heatmap (tile plot) + per-modality counts on the right ----
+plot_coverage_heatmap <- function(df_long, id_col = "ID", out_png = NULL) {
+  # Expect df_long has columns: ID, modality, present(0/1)
+  stopifnot(all(c(id_col, "modality", "present") %in% colnames(df_long)))
+
+  row_counts <- df_long %>%
+    group_by(modality) %>%
+    summarise(N = sum(present), .groups = "drop")
+
+  p <- ggplot(df_long, aes(x = .data[[id_col]], y = modality)) +
+    geom_tile(aes(fill = present),
+              color = "#DCE3EB", linewidth = 0,
+              width = 0.9999, height = 0.90) +
+    scale_fill_gradient(limits = c(0, 1), low = "#DCE3EB", high = "#1f5aa6", guide = "none") +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.title  = element_blank(),
+      panel.grid  = element_blank()
+    ) +
+    geom_text(
+      data = row_counts,
+      aes(x = Inf, y = modality, label = N),
+      inherit.aes = FALSE, hjust = -0.1, size = 3.5
+    ) +
+    coord_cartesian(clip = "off") +
+    theme(plot.margin = margin(5.5, 40, 5.5, 5.5))
+
+  if (!is.null(out_png)) {
+    ggsave(out_png, p, width = 7, height = 3.5, dpi = 300)
+  }
+  p
+}
+
+# ---- Example usage (simulated) ----
+tmp <- simulate_coverage_data()
+df_long_cov <- wide_to_long(tmp$df_wide, tmp$modalities, id_col = "ID")
+p_cov <- plot_coverage_heatmap(df_long_cov, id_col = "ID",
+                               out_png = file.path(OUT_DIR, "coverage_heatmap.png"))
+# print(p_cov)
+
+
+# ============================
+# 2) Kaplan–Meier curve (KM)
+# ============================
+
+# Input requirements:
+#   df must contain columns:
+#     time  : follow-up time (numeric)
+#     event : 1=event, 0=censor
+#     group : risk group (factor/character), e.g., "High"/"Low"
+plot_km <- function(df, time_col = "time", event_col = "event", group_col = "group",
+                    xlab = "Time (years)", ylab = "Progression-free survival",
+                    break_time_by = 1,
+                    legend_title = "Risk",
+                    legend_labs = c("High risk", "Low risk"),
+                    palette = c("#EA3224", "#458834"),
+                    out_pdf = NULL,
+                    width = 6, height = 5) {
+
+  df <- df %>%
+    mutate(
+      .time  = .data[[time_col]],
+      .event = .data[[event_col]],
+      .group = factor(.data[[group_col]], levels = unique(.data[[group_col]]))
+    )
+
+  # Log-rank test p-value
+  diff <- survdiff(Surv(.time, .event) ~ .group, data = df)
+  pval <- 1 - pchisq(diff$chisq, df = length(levels(df$.group)) - 1)
+  pval_txt <- format(signif(pval, 4), scientific = TRUE)
+
+  fit <- survfit(Surv(.time, .event) ~ .group, data = df)
+
+  g <- ggsurvplot(
+    fit,
+    data = df,
+    conf.int = FALSE,
+    pval = paste0("p = ", pval_txt),
+    pval.size = 4,
+    risk.table = TRUE,
+    risk.table.title = "",
+    risk.table.height = 0.25,
+    legend.labs = legend_labs,
+    legend.title = legend_title,
+    xlab = xlab,
+    ylab = ylab,
+    break.time.by = break_time_by,
+    palette = palette
+  )
+
+  if (!is.null(out_pdf)) {
+    pdf(out_pdf, onefile = FALSE, width = width, height = height)
+    print(g)
+    dev.off()
+  }
+  g
+}
+
+
+# ============================
+# 3) C-index (survcomp)
+# ============================
+calc_cindex <- function(df, score_col = "risk_score", time_col = "time", event_col = "event",
+                        method = c("noether", "harrell")) {
+  method <- match.arg(method)
+  cidx <- concordance.index(
+    x = df[[score_col]],
+    surv.time  = df[[time_col]],
+    surv.event = df[[event_col]],
+    method = method
+  )
+  list(
+    c_index = cidx$c.index,
+    se      = cidx$se,
+    p_value = cidx$p.value
+  )
+}
+
+
+# ============================
+# 4) timeROC (AUC + 95% CI + optional p-value vs 0.5)
+# ============================
+
+get_auc_ci <- function(roc_obj) {
+  # If times length = 1, roc_obj$AUC is often length 1 (or length 2 in some versions).
+  # We'll take the first element safely.
+  auc_val <- as.numeric(roc_obj$AUC[1])
+  ci_raw  <- confint(roc_obj)$CI_AUC
+  if (is.matrix(ci_raw)) {
+    ci <- ci_raw[1, ]
+  } else {
+    ci <- ci_raw
+  }
+  list(auc = auc_val, ci = ci)
+}
+
+auc_pvalue_vs_0_5 <- function(auc, ci) {
+  # Normal approximation via CI -> SE
+  se <- (ci[2] - ci[1]) / (2 * 1.96)
+  z  <- (auc - 0.5) / se
+  p  <- 2 * (1 - pnorm(abs(z)))
+  p
+}
+
+plot_timeROC_1_2_3y <- function(df, time_col = "time", event_col = "event", marker_col = "risk_score",
+                                times_year = c(1, 2, 3),
+                                cols = c("#249EBB", "#D0A763", "#D63E09"),
+                                out_pdf = NULL) {
+  # Convert time to years if needed before calling (keep it consistent with times_year)
+  ROC_list <- lapply(times_year, function(ti) {
+    timeROC(
+      T = df[[time_col]],
+      delta = df[[event_col]],
+      marker = df[[marker_col]],
+      cause = 1,
+      weighting = "marginal",
+      times = ti,
+      ROC = TRUE,
+      iid = TRUE
+    )
+  })
+
+  res <- lapply(ROC_list, get_auc_ci)
+
+  if (!is.null(out_pdf)) pdf(out_pdf, width = 6, height = 5)
+
+  plot(ROC_list[[1]], time = times_year[1], col = cols[1], title = FALSE, lwd = 3)
+  if (length(times_year) >= 2) {
+    for (i in 2:length(times_year)) {
+      plot(ROC_list[[i]], time = times_year[i], col = cols[i], title = FALSE, lwd = 3, add = TRUE)
+    }
+  }
+
+  leg <- map2_chr(times_year, res, function(ti, rr) {
+    paste0("AUC (", ti, "-year): ", round(rr$auc, 3),
+           " (95% CI ", round(rr$ci[1], 3), "-", round(rr$ci[2], 3), ")")
+  })
+
+  legend("bottomright", legend = leg, col = cols[seq_along(times_year)],
+         lwd = 3, bty = "n")
+
+  if (!is.null(out_pdf)) dev.off()
+
+  list(ROC = ROC_list, summary = res)
+}
+
+
+# ============================
+# 5) DCA curves
+# ============================
+
+# --- ggDCA example (multiple times) ---
+plot_ggDCA <- function(df, time_col = "time", event_col = "event", pred_col = "pred",
+                       times = c(0.6, 1.2, 1.8), out_png = NULL) {
+  cox_fit <- coxph(Surv(df[[time_col]], df[[event_col]]) ~ df[[pred_col]])
+
+  dca_df <- ggDCA::dca(cox_fit, times = times)
+
+  p <- ggplot(dca_df, aes(x = thresholds, y = NB, color = time_label)) +
+    geom_line(linewidth = 1.1) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_color_npg() +
+    labs(x = "Threshold probability", y = "Net benefit", color = "Time") +
+    theme_classic(base_size = 14)
+
+  if (!is.null(out_png)) ggsave(out_png, p, width = 6.5, height = 4.5, dpi = 300)
+  p
+}
+
+# --- dcurves example (single time) ---
+plot_dcurves <- function(df, time_col = "time", event_col = "event", pred_col = "pred",
+                         time_horizon, out_png = NULL) {
+  fit <- dcurves::dca(
+    Surv(df[[time_col]], df[[event_col]]) ~ df[[pred_col]],
+    data = df,
+    time = time_horizon
+  )
+
+  p <- plot(fit, smooth = TRUE) + theme_minimal(base_size = 14)
+  if (!is.null(out_png)) ggsave(out_png, p, width = 6.5, height = 4.5, dpi = 300)
+  p
+}
+
+
+# ============================
+# 6) Confusion matrix at time horizon (naive / IPCW)
+# ============================
+confmat_time <- function(time, event, score, t0, cutoff,
+                         method = c("naive", "ipcw"),
+                         high_risk_positive = TRUE) {
+  method <- match.arg(method)
+
+  pred_pos <- if (high_risk_positive) score >= cutoff else score <= cutoff
+
+  case    <- (event == 1 & time <= t0)
+  control <- (time > t0)
+
+  if (method == "naive") {
+    keep <- case | control
+
+    TP <- sum(pred_pos[keep] & case[keep])
+    FN <- sum(!pred_pos[keep] & case[keep])
+    FP <- sum(pred_pos[keep] & control[keep])
+    TN <- sum(!pred_pos[keep] & control[keep])
+
+    cm <- matrix(c(TP, FP, FN, TN), nrow = 2, byrow = TRUE,
+                 dimnames = list(Pred = c("Positive", "Negative"),
+                                 Truth = c("Event_by_t0", "Event_free_at_t0")))
+    return(list(method = "naive", cutoff = cutoff, t0 = t0, confusion = cm, n_used = sum(keep)))
+  }
+
+  # IPCW
+  fitG <- survfit(Surv(time, 1 - event) ~ 1)
+
+  G_at <- function(x) {
+    s <- summary(fitG, times = x, extend = TRUE)$surv
+    pmax(s, 1e-6)
+  }
+
+  w <- rep(0, length(time))
+  w[case]    <- 1 / G_at(time[case])
+  w[control] <- 1 / G_at(t0)
+
+  TP <- sum(w * (pred_pos & case))
+  FN <- sum(w * ((!pred_pos) & case))
+  FP <- sum(w * (pred_pos & control))
+  TN <- sum(w * ((!pred_pos) & control))
+
+  cm <- matrix(c(TP, FP, FN, TN), nrow = 2, byrow = TRUE,
+               dimnames = list(Pred = c("Positive", "Negative"),
+                               Truth = c("Event_by_t0", "Event_free_at_t0")))
+  list(method = "ipcw", cutoff = cutoff, t0 = t0, confusion = cm)
+}
+
+plot_confusion_matrix <- function(cm_table, title = "Confusion matrix",
+                                  out_png = NULL,
+                                  row_percent = TRUE) {
+  df_cm <- as.data.frame(as.table(cm_table))
+  colnames(df_cm) <- c("Predicted", "Observed", "Count")
+
+  if (row_percent) {
+    df_cm <- df_cm %>%
+      group_by(Predicted) %>%
+      mutate(Frac = Count / sum(Count)) %>%
+      ungroup()
+    fill_var <- "Frac"
+    df_cm$Label <- sprintf("%d\n(%.1f%%)", df_cm$Count, 100 * df_cm$Frac)
+  } else {
+    df_cm$Frac <- df_cm$Count / sum(df_cm$Count)
+    fill_var <- "Frac"
+    df_cm$Label <- sprintf("%d\n(%.1f%%)", df_cm$Count, 100 * df_cm$Frac)
+  }
+
+  p <- ggplot(df_cm, aes(x = Observed, y = Predicted, fill = .data[[fill_var]])) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = Label), size = 4.5) +
+    scale_x_discrete(position = "top") +
+    scale_fill_gradient(low = "white", high = "#2C7FB8") +
+    coord_fixed() +
+    labs(x = NULL, y = NULL, title = title) +
+    theme_classic(base_size = 14) +
+    theme(plot.title = element_text(hjust = 0.5))
+
+  if (!is.null(out_png)) ggsave(out_png, p, width = 6, height = 5, dpi = 300)
+  p
+}
+
+
+# ============================
+# 7) Calibration curves (rms)
+# ============================
+plot_calibration_three_times <- function(df, time_col = "time", event_col = "event",
+                                         predictor_col = "risk_score",
+                                         times_days = c(365 * 0.8, 365 * 1.6, 365 * 2.4),
+                                         colors = c("#508AC7", "#F09202", "#84201C"),
+                                         B = 500, m = 30,
+                                         out_pdf = NULL) {
+  dd <- datadist(df)
+  options(datadist = "dd")
+
+  if (!is.null(out_pdf)) pdf(out_pdf, width = 6, height = 6)
+
+  for (i in seq_along(times_days)) {
+    t_inc <- times_days[i]
+    coxfit <- cph(Surv(df[[time_col]], df[[event_col]]) ~ df[[predictor_col]],
+                  data = df, x = TRUE, y = TRUE, surv = TRUE, time.inc = t_inc)
+    cal <- calibrate(coxfit, cmethod = "KM", method = "boot", u = t_inc, m = m, B = B)
+
+    if (i == 1) {
+      plot(cal, lty = 0, errbar.col = "#2166AC",
+           xlim = c(0, 1), ylim = c(0, 1),
+           xlab = "Predicted PFS", ylab = "Observed PFS")
+      abline(0, 1, lty = 3, lwd = 2, col = "grey70")
+      box(lwd = 2)
+    } else {
+      plot(cal, lty = 0, errbar.col = "#2166AC",
+           add = TRUE)
+    }
+
+    lines(cal[, c("mean.predicted", "KM")],
+          type = "b", lwd = 3, pch = 16, col = colors[i])
+  }
+
+  legend("bottomright",
+         legend = c("Time-1", "Time-2", "Time-3")[seq_along(times_days)],
+         col = colors[seq_along(times_days)], lwd = 2, bty = "n")
+
+  if (!is.null(out_pdf)) dev.off()
+}
+
+
+# ============================
+# 8) Forest plot helper (forestplot)
+# ============================
+make_fp <- function(df, title = "Cohort", show_lab = TRUE,
+                    col_box = "#CB3133", col_line = "#405176") {
+
+  # Expected df columns:
+  #   1: label
+  #   2: mean(HR)
+  #   3: lower
+  #   4: upper
+  #   5: "HR(95%CI)" string
+  #   6: "P" string
+
+  lab <- if (show_lab) {
+    df[, c(1, 5, 6)]
+  } else {
+    cbind(" " = rep("", nrow(df)), df[, c(5, 6)])
+  }
+
+  forestplot(
+    lab,
+    mean  = df[, 2],
+    lower = df[, 3],
+    upper = df[, 4],
+    zero  = 1,
+    graph.pos  = 2,
+    boxsize    = 0.2,
+    graphwidth = unit(.3, "npc"),
+    hrzl_lines = list(
+      "1"  = gpar(lty = 1, lwd = 2),
+      "2"  = gpar(lty = 2),
+      as.character(nrow(df)) = gpar(lwd = 2, lty = 1, columns = 1:3)
+    ),
+    xticks     = c(0.5, 1, 2, 3, 6),
+    is.summary = c(TRUE, rep(FALSE, nrow(df) - 1)),
+    txt_gp = fpTxtGp(
+      label = gpar(cex = 1.0),
+      ticks = gpar(cex = 0.9),
+      xlab  = gpar(cex = 1.0),
+      title = gpar(cex = 1.2)
+    ),
+    lwd.zero = 1, lwd.xaxis = 1,
+    lwd.ci = 2, lty.ci = 1,
+    ci.vertices = TRUE, ci.vertices.height = .1,
+    clip = c(.1, 8),
+    lineheight  = unit(8, "mm"),
+    line.margin = unit(6, "mm"),
+    colgap      = unit(6, "mm"),
+    xlab  = "Hazard ratio",
+    title = title,
+    col   = fpColors(box = col_box, lines = col_line, zero = "black"),
+    fontsize = 10
+  )
+}
+
+prep_fp_df <- function(df) {
+  rbind(c("Characteristics", NA, NA, NA, "HR(95%CI)", "P"), df)
+}
+
+
+# ============================
+# 9) Modality contribution (pie & bar)
+# ============================
+plot_modality_pie <- function(df, out_png = NULL) {
+  # df: columns modality, value
+  df <- df %>%
+    mutate(percent = value / sum(value) * 100,
+           label = sprintf("%.1f%%", percent))
+
+  p <- ggplot(df, aes(x = "", y = value, fill = modality)) +
+    geom_col(width = 1, color = "white") +
+    coord_polar(theta = "y") +
+    geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+              color = "white", size = 4) +
+    labs(title = "Relative contribution of each modality", x = NULL, y = NULL) +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+  if (!is.null(out_png)) ggsave(out_png, p, width = 6, height = 5, dpi = 300)
+  p
+}
+
+plot_modality_bar <- function(df, out_png = NULL) {
+  df <- df %>%
+    mutate(percent = value / sum(value) * 100,
+           label = sprintf("%.1f%%", percent)) %>%
+    arrange(desc(value)) %>%
+    mutate(modality = factor(modality, levels = modality))
+
+  p <- ggplot(df, aes(x = modality, y = value, fill = modality)) +
+    geom_col(width = 0.6, color = "white") +
+    geom_text(aes(label = label), vjust = -0.4, size = 4) +
+    labs(title = "Modality-level contribution", x = NULL, y = "Contribution") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 20, hjust = 1),
+          legend.position = "none")
+
+  if (!is.null(out_png)) ggsave(out_png, p, width = 7, height = 4.5, dpi = 300)
+  p
+}
+
+
+# ============================
+# 10) Radar chart (fmsb)
+# ============================
+plot_radar <- function(dat, model_names, colors, seg = 5, out_png = NULL) {
+  # dat must follow fmsb format:
+  #   row1 = max, row2 = min, rows 3.. = models
+  op <- par(mar = c(1, 1, 1, 1))
+  radarchart(
+    dat,
+    axistype = 2,
+    pcol  = colors,
+    pfcol = scales::alpha(colors, 0.25),
+    seg   = seg,
+    plwd  = 2,
+    cglcol = "grey85",
+    cglwd  = 0.8,
+    axislabcol = "grey40",
+    vlcex  = 1.1
+  )
+  legend("topright", legend = model_names, bty = "n",
+         pch = 15, pt.cex = 2, col = colors, text.col = "black")
+  par(op)
+
+  if (!is.null(out_png)) {
+    # For base plots, save via png device externally
+    message("Radar chart uses base plotting. Save with png()/dev.off() if needed.")
+  }
+}
+
+
+# ============================
+# 11) Cross-modal attention heatmap
+# ============================
+plot_attention_heatmap <- function(mat4x4, out_png = NULL) {
+  # mat4x4: numeric matrix with row/col names already set
+  q <- quantile(mat4x4, probs = c(0.02, 0.98), na.rm = TRUE)
+  mat2 <- pmin(pmax(mat4x4, q[1]), q[2])
+
+  cols <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+
+  pheatmap(mat2,
+           display_numbers = TRUE,
+           cluster_rows = FALSE,
+           cluster_cols = FALSE,
+           color = cols,
+           legend = FALSE,
+           border_color = "white",
+           filename = out_png)
+}
+
+plot_attention_heatmap_complex <- function(mat4x4) {
+  # ComplexHeatmap version (more flexible)
+  Heatmap(
+    as.matrix(mat4x4),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    show_column_names = TRUE,
+    col = colorRamp2(
+      breaks = c(min(mat4x4), mean(mat4x4), max(mat4x4)),
+      colors = c("#2166AC", "white", "#B2182B")
+    ),
+    border = TRUE,
+    rect_gp = gpar(col = "white", lwd = 1)
+  )
+}
+
+# ============================================================
+# End of template
+# ============================================================
+
+# ------------------------------
+# Minimal "how to plug your data"
+# ------------------------------
+# Example expected survival dataframe columns:
+#   df <- read.csv(file.path(DATA_DIR, "survival.csv"))
+#   df should include: time, event, risk_score, group
+#
+# Example KM:
+#   plot_km(df, time_col="time", event_col="event", group_col="group",
+#           out_pdf=file.path(OUT_DIR, "KM_curve.pdf"))
+#
+# Example timeROC:
+#   df$time_years <- df$time / 12
+#   plot_timeROC_1_2_3y(df, time_col="time_years", event_col="event",
+#                       marker_col="risk_score",
+#                       out_pdf=file.path(OUT_DIR, "timeROC.pdf"))
+#
+# Example confusion matrix at 24 months:
+#   cm <- confmat_time(df$time, df$event, df$risk_score, t0=24, cutoff=0.2, method="naive")
+#   plot_confusion_matrix(cm$confusion, title="Confusion Matrix (24 months)",
+#                         out_png=file.path(OUT_DIR,"cm_24m.png"))
