@@ -1,0 +1,210 @@
+# -*- coding: utf-8 -*-
+"""
+evaluate_model_external_test.py
+--------------------------------
+Load a trained model and run inference on an external test set.
+
+Outputs:
+  - C-index / Cox-PH loss on the external test set
+  - Risk scores saved to an Excel file (risk_scores.xlsx by default)
+
+Usage example:
+  python evaluate_model_external_test.py \
+    --data_dir_test ./data/external_test \
+    --model_path ./checkpoints/best_model.pth \
+    --path_risk ./outputs/risk_scores.xlsx
+"""
+
+import math
+import os
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from lifelines.utils import concordance_index
+
+
+# ---------- Cox-PH loss ----------
+def cox_ph_loss(risk, time, event, eps=1e-8):
+    risk, time, event = [x.view(-1) for x in (risk, time, event)]
+    idx = torch.argsort(time, descending=True)
+    risk = risk[idx]
+    event = event[idx]
+    log_c = torch.logcumsumexp(risk, 0)
+    return -(event * (risk - log_c)).sum() / (event.sum() + eps)
+
+
+# ---------- Model (same as training) ----------
+class ModalityEncoder(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, out_dim, bias=False),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
+class self_att(nn.Module):
+    def __init__(self, input_dim: int = 768, hidden_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.query_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.key_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.value_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        Q = self.query_proj(x)
+        K = self.key_proj(x)
+        V = self.value_proj(x)
+
+        attent_value = torch.matmul(Q, K.transpose(-1, -2))
+        attent_weight = torch.softmax(attent_value / math.sqrt(self.hidden_dim), dim=-1)
+        output = torch.matmul(attent_weight, V)
+        return output
+
+
+class Surv_attention(nn.Module):
+    """Forward returns risk score."""
+    def __init__(self):
+        super().__init__()
+        self.MRI = ModalityEncoder(1342, 768)
+        self.attention1 = self_att(768, 256)
+        self.attention2 = self_att(256, 256)
+        self.ln = nn.LayerNorm(256, eps=1e-5, elementwise_affine=True)
+
+        self.for_head = nn.Sequential(
+            nn.Linear(1024, 32, bias=False),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, mri, wsi, ich, text):
+        MRI_feat = self.MRI(mri)
+        combined_tensor = torch.stack([MRI_feat, wsi, ich, text], dim=1)
+        z1 = self.attention1(combined_tensor)
+        z3 = self.ln(z1).flatten(1)
+        risk = self.for_head(z3)
+        return risk
+
+
+# ---------- Dataset ----------
+class MultimodalDataset(Dataset):
+    def __init__(self, mri, wsi, ich, text, surv):
+        self.mri = torch.tensor(mri.values, dtype=torch.float32)
+        self.wsi = torch.tensor(wsi.values, dtype=torch.float32)
+        self.ich = torch.tensor(ich.values, dtype=torch.float32)
+        self.text = torch.tensor(text.values, dtype=torch.float32)
+        self.time = torch.tensor(surv["time"].values, dtype=torch.float32)
+        self.event = torch.tensor(surv["event"].values, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.time)
+
+    def __getitem__(self, idx):
+        return (
+            self.mri[idx],
+            self.wsi[idx],
+            self.ich[idx],
+            self.text[idx],
+            self.time[idx],
+            self.event[idx],
+        )
+
+
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_dir_test",
+        type=str,
+        default="./data/external_test",
+        help="Directory containing external test Excel files."
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="./checkpoints/best_model.pth",
+        help="Path to the trained model weights (.pth)."
+    )
+    parser.add_argument(
+        "--path_risk",
+        type=str,
+        default="./outputs/risk_scores.xlsx",
+        help="Output path for risk scores Excel."
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=256,
+        help="Batch size for inference."
+    )
+    return parser.parse_args()
+
+
+# ---------------- Main ----------------
+def main():
+    args = parse_args()
+
+    os.makedirs(os.path.dirname(args.path_risk) or ".", exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1) Read external test set
+    mri = pd.read_excel(os.path.join(args.data_dir_test, "sd_MRI_features.xlsx"), index_col=0)
+    wsi = pd.read_excel(os.path.join(args.data_dir_test, "sd_wsi_features.xlsx"), index_col=0)
+    ich = pd.read_excel(os.path.join(args.data_dir_test, "sd_ich_features.xlsx"), index_col=0)
+    text = pd.read_excel(os.path.join(args.data_dir_test, "sd_clinical_features.xlsx"), index_col=0)
+    surv = pd.read_excel(os.path.join(args.data_dir_test, "sd_PFS_survival.xlsx"), index_col=0)
+
+    print(f"▶ External test samples: {len(surv)}")
+
+    ds_test = MultimodalDataset(mri, wsi, ich, text, surv)
+    dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False)
+
+    # 2) Load model
+    model = Surv_attention().to(device)
+    state = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    print("✔ Model weights loaded.")
+
+    # 3) Inference
+    risks, times, events = [], [], []
+    with torch.no_grad():
+        for mri_b, wsi_b, ich_b, txt_b, t_b, e_b in dl_test:
+            mri_b = mri_b.to(device)
+            wsi_b = wsi_b.to(device)
+            ich_b = ich_b.to(device)
+            txt_b = txt_b.to(device)
+
+            r = model(mri_b, wsi_b, ich_b, txt_b)
+            risks.append(r.cpu())
+            times.append(t_b)
+            events.append(e_b)
+
+    risks = torch.cat(risks).squeeze(1)  # (N,)
+    times = torch.cat(times)
+    events = torch.cat(events)
+
+    # 4) Metrics
+    c_index_test = concordance_index(times.numpy(), -risks.numpy(), events.numpy())
+    avg_cox_loss = cox_ph_loss(risks, times, events).item()
+
+    # 5) Save outputs
+    pd.DataFrame({"risk": risks.numpy()}).to_excel(args.path_risk, index=False)
+
+    print("\n======= External Test Evaluation =======")
+    print(f"C-index          : {c_index_test:.4f}")
+    print(f"Avg Cox-PH Loss  : {avg_cox_loss:.4f}")
+    print(f"Risk saved to    : {args.path_risk}")
+
+
+if __name__ == "__main__":
+    main()
