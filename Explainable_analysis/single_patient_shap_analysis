@@ -1,0 +1,428 @@
+import os
+import math
+import argparse
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from lifelines.utils import concordance_index
+
+import shap
+import matplotlib
+matplotlib.use("Agg")  # 使用无界面后端，避免弹出窗口
+import matplotlib.pyplot as plt
+
+
+# ---------- Cox-PH loss（可选） ----------
+def cox_ph_loss(risk, time, event, eps=1e-8):
+    risk, time, event = [x.view(-1) for x in (risk, time, event)]
+    idx = torch.argsort(time, descending=True)
+    risk = risk[idx]
+    event = event[idx]
+    log_c = torch.logcumsumexp(risk, 0)
+    return -(event * (risk - log_c)).sum() / (event.sum() + eps)
+
+
+# ---------- 模型子模块 ----------
+class ModalityEncoder(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, out_dim, bias=False),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
+class self_att(nn.Module):
+    def __init__(self, input_dim: int = 768, hidden_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.query_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.key_proj   = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.value_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        # x: (B, 4, input_dim)
+        Q = self.query_proj(x)                      # (B,4,hidden_dim)
+        K = self.key_proj(x)                        # (B,4,hidden_dim)
+        V = self.value_proj(x)                      # (B,4,hidden_dim)
+
+        attn = torch.matmul(Q, K.transpose(-1, -2)) # (B,4,4)
+        attn = torch.softmax(attn / math.sqrt(self.hidden_dim), dim=-1)
+        out  = torch.matmul(attn, V)                # (B,4,hidden_dim)
+        return out
+
+
+# ---------- 与训练时结构一致的 Surv_attention ----------
+class Surv_attention(nn.Module):
+    """
+    注意：保留 attention2 这一层，保证能正确加载 checkpoint。
+    """
+    def __init__(self):
+        super().__init__()
+        self.MRI = ModalityEncoder(1342, 768)
+        self.attention1 = self_att(768, 256)
+        self.attention2 = self_att(256, 256)  # 训练时模型中存在
+        self.ln = nn.LayerNorm(256, eps=1e-5, elementwise_affine=True)
+        self.for_head = nn.Sequential(
+            nn.Linear(1024, 32, bias=False),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, mri, wsi, ich, text):
+        MRI_feat = self.MRI(mri)                                 # (B,1342) -> (B,768)
+        combined = torch.stack([MRI_feat, wsi, ich, text], dim=1) # (B,4,768)
+        z1 = self.attention1(combined)                            # (B,4,256)
+        # z2 = self.attention2(z1)                                # 训练时代码未使用
+        z3 = self.ln(z1).flatten(1)                               # (B,4,256) -> (B,1024)
+        risk = self.for_head(z3)                                  # (B,1)
+        return risk
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="./data/train_explain",
+        help="Directory containing MRI_features.xlsx / wsi_features.xlsx / ich_features.xlsx / Clinical_features.xlsx / PFS_survival.xlsx"
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="./checkpoints/best_model.pth",
+        help="Path to model checkpoint (.pth)"
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Output directory for PDFs. Default: <data_dir>/shap_forceplots_pdf"
+    )
+    parser.add_argument("--patient_id", type=int, default=50, help="Patient index (0-based)")
+    parser.add_argument("--background_size", type=int, default=35, help="Background samples for DeepExplainer")
+    parser.add_argument("--max_display", type=int, default=15, help="Top-K features to show")
+    parser.add_argument("--max_name_len", type=int, default=18, help="Max feature name length for display")
+    parser.add_argument("--device", type=str, default=None, help="cpu or cuda (default: auto)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    return parser.parse_args()
+
+
+# ---------- 载入数据与模型 ----------
+def load_data_and_model(device, data_dir, model_path):
+    mri_df  = pd.read_excel(os.path.join(data_dir, "MRI_features.xlsx"),      index_col=0)
+    wsi_df  = pd.read_excel(os.path.join(data_dir, "wsi_features.xlsx"),      index_col=0)
+    ich_df  = pd.read_excel(os.path.join(data_dir, "ich_features.xlsx"),      index_col=0)
+    text_df = pd.read_excel(os.path.join(data_dir, "Clinical_features.xlsx"), index_col=0)
+    surv_df = pd.read_excel(os.path.join(data_dir, "PFS_survival.xlsx"),      index_col=0)
+
+    print(f"样本数: {len(surv_df)}")
+
+    X_mri  = torch.tensor(mri_df.values,  dtype=torch.float32).to(device)
+    X_wsi  = torch.tensor(wsi_df.values,  dtype=torch.float32).to(device)
+    X_ich  = torch.tensor(ich_df.values,  dtype=torch.float32).to(device)
+    X_text = torch.tensor(text_df.values, dtype=torch.float32).to(device)
+
+    time  = torch.tensor(surv_df["time"].values,  dtype=torch.float32).to(device)
+    event = torch.tensor(surv_df["event"].values, dtype=torch.float32).to(device)
+
+    model = Surv_attention().to(device)
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    print("✔ 已加载模型权重")
+
+    with torch.no_grad():
+        risk = model(X_mri, X_wsi, X_ich, X_text).view(-1)
+
+    c_index = concordance_index(time.cpu().numpy(), -risk.cpu().numpy(), event.cpu().numpy())
+    print(f"C-index (全体样本): {c_index:.4f}")
+
+    return model, (mri_df, wsi_df, ich_df, text_df), (X_mri, X_wsi, X_ich, X_text), (time, event), risk
+
+
+# ---------- 构建 SHAP DeepExplainer ----------
+def build_shap_explainer(model, X_mri, X_wsi, X_ich, X_text, background_size=100):
+    model.eval()
+    n = X_mri.shape[0]
+    bg_size = min(background_size, n)
+    idx = np.random.choice(n, size=bg_size, replace=False)
+
+    background = [X_mri[idx], X_wsi[idx], X_ich[idx], X_text[idx]]
+    explainer = shap.DeepExplainer(model, background)
+    return explainer
+
+
+# ---------- 工具：缩短特征名 ----------
+def shorten_feature_names(names, max_len=18):
+    short = []
+    for n in names:
+        if len(n) <= max_len:
+            short.append(n)
+        else:
+            if "_" in n:
+                prefix, rest = n.split("_", 1)
+                keep_rest = max_len - len(prefix) - 4  # "_..."
+                if keep_rest > 0:
+                    short.append(prefix + "_" + rest[:keep_rest] + "...")
+                else:
+                    short.append(n[:max_len - 3] + "...")
+            else:
+                short.append(n[:max_len - 3] + "...")
+    return short
+
+
+# ---------- 工具：标签横排 ----------
+def rotate_forceplot_feature_labels(ax, fontsize=8):
+    """
+    保留 higher/lower/base value/f(x) 等说明为横向，
+    其他特征标签也保持横向，只调整字号和对齐方式。
+    """
+    header_keywords = ["higher", "lower", "f(x)", "base value", "model output value"]
+    for text in ax.texts:
+        s = text.get_text()
+        if any(k in s for k in header_keywords):
+            continue
+        text.set_rotation(0)
+        text.set_fontsize(fontsize)
+        text.set_ha("center")
+        text.set_va("bottom")
+
+
+# ---------- 工具：把“feat = value”里的 value 改成 1 位小数 ----------
+def format_forceplot_feature_values(ax, decimals: int = 1):
+    for text in ax.texts:
+        s = text.get_text()
+        if "=" not in s:
+            continue
+        left, right = s.rsplit("=", 1)
+        val_str = right.strip()
+        try:
+            num = float(val_str)
+        except ValueError:
+            continue
+        new_val = f"{num:.{decimals}f}"
+        text.set_text(f"{left.strip()} = {new_val}")
+
+
+# ---------- 工具：获取某个患者的 shap & 特征 ----------
+def _get_patient_shap_and_features(patient_id, explainer, dfs, tensors):
+    mri_df, wsi_df, ich_df, text_df = dfs
+    X_mri, X_wsi, X_ich, X_text = tensors
+
+    x_mri_t  = X_mri[patient_id:patient_id + 1]
+    x_wsi_t  = X_wsi[patient_id:patient_id + 1]
+    x_ich_t  = X_ich[patient_id:patient_id + 1]
+    x_text_t = X_text[patient_id:patient_id + 1]
+
+    shap_values_list = explainer.shap_values(
+        [x_mri_t, x_wsi_t, x_ich_t, x_text_t],
+        check_additivity=False
+    )
+
+    shap_mri  = np.array(shap_values_list[0]).reshape(1, -1)
+    shap_wsi  = np.array(shap_values_list[1]).reshape(1, -1)
+    shap_ich  = np.array(shap_values_list[2]).reshape(1, -1)
+    shap_text = np.array(shap_values_list[3]).reshape(1, -1)
+    shap_all  = np.concatenate([shap_mri, shap_wsi, shap_ich, shap_text], axis=1)
+
+    x_mri_np  = x_mri_t.detach().cpu().numpy().reshape(1, -1)
+    x_wsi_np  = x_wsi_t.detach().cpu().numpy().reshape(1, -1)
+    x_ich_np  = x_ich_t.detach().cpu().numpy().reshape(1, -1)
+    x_text_np = x_text_t.detach().cpu().numpy().reshape(1, -1)
+    x_all     = np.concatenate([x_mri_np, x_wsi_np, x_ich_np, x_text_np], axis=1)
+
+    feat_names = (
+        ["MRI_" + c for c in mri_df.columns.to_list()] +
+        ["WSI_" + c for c in wsi_df.columns.to_list()] +
+        ["ICH_" + c for c in ich_df.columns.to_list()] +
+        ["CLN_" + c for c in text_df.columns.to_list()]
+    )
+
+    base_values = explainer.expected_value
+    if isinstance(base_values, (list, tuple, np.ndarray)):
+        base_value = float(base_values[0])
+    else:
+        base_value = float(base_values)
+
+    return shap_all, x_all, feat_names, base_value
+
+
+# ---------- 单个患者 force plot（Top-K + 横字标签 + 保存 PDF） ----------
+def force_plot_single_patient(
+    patient_id: int,
+    explainer,
+    dfs,
+    tensors,
+    risk_tensor,
+    out_dir: str,
+    max_display: int = 6,
+    max_name_len: int = 18,
+):
+    shap_all, x_all, feat_names, base_value = _get_patient_shap_and_features(
+        patient_id, explainer, dfs, tensors
+    )
+    shap_1d = shap_all[0]
+    x_1d = x_all[0]
+
+    idx_sorted = np.argsort(-np.abs(shap_1d))
+    top_idx = idx_sorted[:max_display]
+
+    shap_top = shap_1d[top_idx]
+    x_top = x_1d[top_idx]
+    names_top = [feat_names[i] for i in top_idx]
+    short_names_top = shorten_feature_names(names_top, max_len=max_name_len)
+
+    x_top_rounded = np.round(x_top, 1)
+    X_display = pd.DataFrame([x_top_rounded], columns=short_names_top)
+
+    patient_risk = float(risk_tensor[patient_id].detach().cpu().numpy())
+    print(f"\n===== 患者 {patient_id} 的预测复发风险（模型输出）: {patient_risk:.4f} =====")
+    print(f"SHAP 基准风险 (expected value): {base_value:.4f}")
+    print("Top 特征（short_name -> full_name）：")
+    for short, full, v, s in zip(short_names_top, names_top, x_top, shap_top):
+        print(f"{short:<20s} -> {full:<60s} | value={v:.1f}  shap={s:.4f}")
+
+    plt.close("all")
+
+    vis = shap.force_plot(
+        base_value,
+        shap_top,
+        X_display.iloc[0, :],
+        matplotlib=True,
+        show=False
+    )
+
+    # 兼容不同版本 shap 的返回
+    if hasattr(vis, "fig"):
+        fig = vis.fig
+    else:
+        fig = plt.gcf()
+
+    if hasattr(vis, "ax"):
+        ax = vis.ax
+    else:
+        ax = plt.gca()
+
+    rotate_forceplot_feature_labels(ax, fontsize=8)
+    format_forceplot_feature_values(ax, decimals=1)
+
+    fx = base_value + shap_top.sum()
+    delta = abs(fx - base_value)
+    if delta < 1e-6:
+        delta = 1e-6
+    center = (fx + base_value) / 2.0
+    width = 4.0 * delta
+    ax.set_xlim(center - width / 2.0, center + width / 2.0)
+
+    fig.set_size_inches(10, 4)
+    fig.tight_layout()
+
+    os.makedirs(out_dir, exist_ok=True)
+    pdf_path = os.path.join(out_dir, f"patient_{patient_id}_forceplot.pdf")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"已保存 force plot PDF: {pdf_path}")
+
+
+# ---------- 单个患者 waterfall 图 ----------
+def waterfall_plot_single_patient(
+    patient_id: int,
+    explainer,
+    dfs,
+    tensors,
+    out_dir: str,
+    max_display: int = 10,
+    max_name_len: int = 18,
+):
+    shap_all, x_all, feat_names, base_value = _get_patient_shap_and_features(
+        patient_id, explainer, dfs, tensors
+    )
+    shap_1d = shap_all[0]
+    x_1d = x_all[0]
+
+    idx_sorted = np.argsort(-np.abs(shap_1d))
+    top_idx = idx_sorted[:max_display]
+
+    shap_top = shap_1d[top_idx]
+    x_top = x_1d[top_idx]
+    names_top = [feat_names[i] for i in top_idx]
+    short_names_top = shorten_feature_names(names_top, max_len=max_name_len)
+
+    x_top_rounded = np.round(x_top, 1)
+
+    expl = shap.Explanation(
+        values=shap_top,
+        base_values=base_value,
+        data=x_top_rounded,
+        feature_names=short_names_top
+    )
+
+    plt.close("all")
+    shap.plots.waterfall(expl, max_display=max_display, show=False)
+
+    fig = plt.gcf()
+    fig.set_size_inches(8, 6)
+    plt.tight_layout()
+
+    os.makedirs(out_dir, exist_ok=True)
+    pdf_path = os.path.join(out_dir, f"patient_{patient_id}_waterfall.pdf")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"已保存 waterfall PDF: {pdf_path}")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if args.device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    if args.out_dir is None:
+        out_dir = os.path.join(args.data_dir, "shap_forceplots_pdf")
+    else:
+        out_dir = args.out_dir
+
+    model, dfs, tensors, surv_info, risk = load_data_and_model(device, args.data_dir, args.model_path)
+    X_mri, X_wsi, X_ich, X_text = tensors
+
+    explainer = build_shap_explainer(
+        model,
+        X_mri, X_wsi, X_ich, X_text,
+        background_size=args.background_size
+    )
+
+    force_plot_single_patient(
+        args.patient_id,
+        explainer,
+        dfs,
+        tensors,
+        risk,
+        out_dir=out_dir,
+        max_display=args.max_display,
+        max_name_len=args.max_name_len
+    )
+
+    waterfall_plot_single_patient(
+        args.patient_id,
+        explainer,
+        dfs,
+        tensors,
+        out_dir=out_dir,
+        max_display=args.max_display,
+        max_name_len=args.max_name_len
+    )
