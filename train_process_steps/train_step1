@@ -1,1 +1,466 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Multimodal Self-Attention Survival Model (Cox PH) with K-fold CV.
+
+Key points (consistent with manuscript):
+- At the beginning of each epoch, sample jitter amplitude jr ~ Uniform([-1, 1]).
+- Add element-wise Gaussian noise with std = |jr| to the concatenated multimodal vector.
+
+Dependencies:
+  pip install torch pandas numpy scikit-learn lifelines openpyxl
+
+Inputs (Excel files under --data_dir):
+  MRI_features.xlsx
+  WSI_features.xlsx
+  Pathology_reports_features.xlsx
+  Clinical_records_features.xlsx
+  PFS_survival.xlsx  (must contain columns: time, event)
+
+Example:
+  python train_surv_attention.py \
+    --data_dir /path/to/data \
+    --out_dir  /path/to/out \
+    --folds 5 --epochs 200 --batch_size 128 --lr 1e-5 --weight_decay 1e-2 \
+    --jitter_low -1 --jitter_high 1
+"""
+
+from __future__ import annotations
+
+import os
+import math
+import sys
+import random
+import argparse
+import warnings
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import KFold
+from lifelines.utils import concordance_index
+
+warnings.filterwarnings("ignore")
+
+
+# -------------------------
+# Utils
+# -------------------------
+def set_seed(seed: int = 63) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+# -------------------------
+# Cox PH Loss
+# -------------------------
+def cox_ph_loss(
+    risk_score: torch.Tensor,
+    time: torch.Tensor,
+    event: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Negative partial log-likelihood for Cox PH.
+
+    risk_score: [B, 1] or [B]
+    time/event: [B]
+    """
+    risk = risk_score.view(-1)
+    time = time.view(-1)
+    event = event.view(-1)
+
+    order = torch.argsort(time, descending=True)
+    risk, event = risk[order], event[order]
+    log_cumsum = torch.logcumsumexp(risk, dim=0)
+    nll = -(event * (risk - log_cumsum)).sum()
+    return nll / (event.sum() + eps)
+
+
+# -------------------------
+# Model
+# -------------------------
+class ModalityEncoder(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int = 768):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, out_dim, bias=False),
+            nn.ReLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, input_dim: int = 768, hidden_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.q = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.k = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(input_dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        Q = self.q(x)
+        K = self.k(x)
+        V = self.v(x)
+        attn_logits = torch.matmul(Q, K.transpose(-1, -2))  # [B, T, T]
+        attn_weight = torch.softmax(attn_logits / math.sqrt(self.hidden_dim), dim=-1)
+        out = torch.matmul(attn_weight, V)  # [B, T, hidden_dim]
+        return out
+
+
+class SurvAttention(nn.Module):
+    """
+    4 modality tokens -> self-attention -> flatten -> risk score (for Cox loss)
+    """
+    def __init__(self, in_dims: Dict[str, int]):
+        super().__init__()
+
+        # Map each modality to 768-d so tokens are consistent
+        self.enc_mri  = ModalityEncoder(in_dims["mri"],  768)
+        self.enc_wsi  = ModalityEncoder(in_dims["wsi"],  768)
+        self.enc_ich  = ModalityEncoder(in_dims["ich"],  768)
+        self.enc_text = ModalityEncoder(in_dims["text"], 768)
+
+        self.attn = SelfAttention(768, 256)
+        self.ln = nn.LayerNorm(256, eps=1e-5, elementwise_affine=True)
+
+        # 4 tokens * 256 = 1024
+        # IMPORTANT: Cox risk score should be unconstrained (no sigmoid)
+        self.head = nn.Sequential(
+            nn.Linear(1024, 32, bias=False),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 1, bias=False),
+        )
+
+        self.apply(self._init_w)
+
+    @staticmethod
+    def _init_w(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, mri: torch.Tensor, wsi: torch.Tensor, ich: torch.Tensor, text: torch.Tensor) -> torch.Tensor:
+        mri_feat  = self.enc_mri(mri)
+        wsi_feat  = self.enc_wsi(wsi)
+        ich_feat  = self.enc_ich(ich)
+        text_feat = self.enc_text(text)
+
+        tokens = torch.stack([mri_feat, wsi_feat, ich_feat, text_feat], dim=1)  # [B, 4, 768]
+        z = self.attn(tokens)  # [B, 4, 256]
+        z = self.ln(z).flatten(1)  # [B, 1024]
+        risk = self.head(z)  # [B, 1]
+        return risk
+
+
+# -------------------------
+# Dataset
+# -------------------------
+class MultimodalDataset(Dataset):
+    """
+    Feature-level jitter augmentation (consistent with manuscript):
+
+    If augment=True:
+      1) Concatenate all modalities into one vector
+      2) Sample jitter amplitude jr ~ Uniform([-1, 1]) per epoch
+      3) Add Gaussian noise with std = |jr| element-wise: x' = x + N(0, |jr|)
+      4) Split back into modality-specific inputs
+    """
+    def __init__(self, mri, wsi, ich, txt, surv_df, augment: bool = False):
+        self.mri = torch.FloatTensor(mri.values)
+        self.wsi = torch.FloatTensor(wsi.values)
+        self.ich = torch.FloatTensor(ich.values)
+        self.txt = torch.FloatTensor(txt.values)
+
+        self.time = torch.FloatTensor(surv_df["time"].values)
+        self.event = torch.FloatTensor(surv_df["event"].values)
+
+        self.augment = augment
+        self.jr = 0.0
+
+        self.len_m = self.mri.shape[1]
+        self.len_w = self.wsi.shape[1]
+        self.len_i = self.ich.shape[1]
+        self.len_t = self.txt.shape[1]
+
+        # independent RNG per dataset (seed refreshed each epoch)
+        self.gen = torch.Generator()
+
+    def set_jitter(self, jr: float, seed: int | None = None):
+        self.jr = float(jr)
+        if seed is not None:
+            self.gen.manual_seed(int(seed))
+
+    def __len__(self) -> int:
+        return len(self.time)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        m = self.mri[idx]
+        w = self.wsi[idx]
+        i = self.ich[idx]
+        t = self.txt[idx]
+
+        if self.augment and self.jr != 0:
+            vec = torch.cat([m, w, i, t], dim=0)
+
+            # IMPORTANT: manuscript samples jr in [-1, 1], but noise scale uses |jr| as amplitude (std)
+            noise = torch.randn(vec.size(), generator=self.gen) * abs(self.jr)
+            vec = vec + noise
+
+            # Correct slicing
+            s0 = 0
+            s1 = s0 + self.len_m
+            s2 = s1 + self.len_w
+            s3 = s2 + self.len_i
+            s4 = s3 + self.len_t
+
+            m = vec[s0:s1]
+            w = vec[s1:s2]
+            i = vec[s2:s3]
+            t = vec[s3:s4]
+
+        return {
+            "mri": m,
+            "wsi": w,
+            "ich": i,
+            "text": t,
+            "time": self.time[idx],
+            "event": self.event[idx],
+        }
+
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    return {k: torch.stack([x[k] for x in batch]) for k in batch[0]}
+
+
+# -------------------------
+# Train config
+# -------------------------
+@dataclass
+class TrainConfig:
+    batch_size: int
+    epochs: int
+    lr: float
+    weight_decay: float
+    folds: int
+    seed: int
+    jitter_range: Tuple[float, float]
+    num_workers: int = 0
+
+
+# -------------------------
+# Fold runner
+# -------------------------
+def run_one_fold(
+    fold_id: int,
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray,
+    mri: pd.DataFrame,
+    wsi: pd.DataFrame,
+    ich: pd.DataFrame,
+    txt: pd.DataFrame,
+    surv: pd.DataFrame,
+    dev: torch.device,
+    cfg: TrainConfig,
+    out_dir: str,
+) -> Tuple[float, str]:
+    ds_tr = MultimodalDataset(mri.iloc[tr_idx], wsi.iloc[tr_idx], ich.iloc[tr_idx], txt.iloc[tr_idx], surv.iloc[tr_idx], augment=True)
+    ds_va = MultimodalDataset(mri.iloc[va_idx], wsi.iloc[va_idx], ich.iloc[va_idx], txt.iloc[va_idx], surv.iloc[va_idx], augment=False)
+
+    dl_tr = DataLoader(
+        ds_tr, batch_size=cfg.batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=cfg.num_workers
+    )
+    dl_va = DataLoader(
+        ds_va, batch_size=cfg.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=cfg.num_workers
+    )
+
+    in_dims = {"mri": mri.shape[1], "wsi": wsi.shape[1], "ich": ich.shape[1], "text": txt.shape[1]}
+    model = SurvAttention(in_dims).to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    best_c = -1.0
+    best_path = os.path.join(out_dir, f"fold{fold_id:02d}_best.pth")
+
+    for ep in range(1, cfg.epochs + 1):
+        # Refresh jitter amplitude & random seed each epoch:
+        # jr is sampled from Uniform([-1, 1]) as described in the manuscript.
+        jr = random.uniform(*cfg.jitter_range)
+        seed = random.randrange(10**9)
+        ds_tr.set_jitter(jr, seed)
+
+        # ---- Train ----
+        model.train()
+        loss_sum = 0.0
+        r_tr, t_tr, e_tr = [], [], []
+
+        for b in dl_tr:
+            # move to device
+            for k in b:
+                b[k] = b[k].to(dev)
+
+            r = model(b["mri"], b["wsi"], b["ich"], b["text"])
+            loss = cox_ph_loss(r, b["time"], b["event"])
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            loss_sum += float(loss.item())
+            r_tr.append(r.detach().cpu())
+            t_tr.append(b["time"].detach().cpu())
+            e_tr.append(b["event"].detach().cpu())
+
+        loss_avg = loss_sum / max(1, len(dl_tr))
+        train_c = concordance_index(
+            torch.cat(t_tr).numpy(),
+            -torch.cat(r_tr).view(-1).numpy(),
+            torch.cat(e_tr).numpy(),
+        )
+
+        # ---- Val ----
+        model.eval()
+        r_va, t_va, e_va = [], [], []
+        with torch.no_grad():
+            for b in dl_va:
+                for k in b:
+                    b[k] = b[k].to(dev)
+
+                r = model(b["mri"], b["wsi"], b["ich"], b["text"])
+                r_va.append(r.detach().cpu())
+                t_va.append(b["time"].detach().cpu())
+                e_va.append(b["event"].detach().cpu())
+
+        val_c = concordance_index(
+            torch.cat(t_va).numpy(),
+            -torch.cat(r_va).view(-1).numpy(),
+            torch.cat(e_va).numpy(),
+        )
+
+        if val_c > best_c:
+            best_c = val_c
+            torch.save(model.state_dict(), best_path)
+
+        print(f"[Fold {fold_id:02d} | Ep {ep:03d}] JR={jr:+.3f} (std={abs(jr):.3f}) "
+              f"Loss={loss_avg:.4f} Train-C={train_c:.4f} Val-C={val_c:.4f}")
+
+    return best_c, best_path
+
+
+# -------------------------
+# IO / Main
+# -------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", type=str, required=True, help="Directory containing input Excel files.")
+    p.add_argument("--out_dir", type=str, required=True, help="Output directory for logs and weights.")
+    p.add_argument("--folds", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--seed", type=int, default=63)
+    p.add_argument("--jitter_low", type=float, default=-1.0)
+    p.add_argument("--jitter_high", type=float, default=1.0)
+    p.add_argument("--num_workers", type=int, default=0)
+    return p.parse_args()
+
+
+def load_and_align(data_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    mri  = pd.read_excel(os.path.join(data_dir, "MRI_features.xlsx"), index_col=0)
+    wsi  = pd.read_excel(os.path.join(data_dir, "WSI_features.xlsx"), index_col=0)
+    ich  = pd.read_excel(os.path.join(data_dir, "Pathology_reports_features.xlsx"), index_col=0)
+    txt  = pd.read_excel(os.path.join(data_dir, "Clinical_records_features.xlsx"), index_col=0)
+    surv = pd.read_excel(os.path.join(data_dir, "PFS_survival.xlsx"), index_col=0)
+
+    if "time" not in surv.columns or "event" not in surv.columns:
+        raise ValueError("PFS_survival.xlsx must contain columns: 'time' and 'event'.")
+
+    # Align indices across all modalities + survival
+    common = mri.index.intersection(wsi.index).intersection(ich.index).intersection(txt.index).intersection(surv.index)
+    mri, wsi, ich, txt, surv = mri.loc[common], wsi.loc[common], ich.loc[common], txt.loc[common], surv.loc[common]
+
+    return mri, wsi, ich, txt, surv
+
+
+def main() -> None:
+    args = parse_args()
+    ensure_dir(args.out_dir)
+
+    # logging to file (optional)
+    log_path = os.path.join(args.out_dir, "train_log.txt")
+    orig_stdout = sys.stdout
+    sys.stdout = open(log_path, "w", buffering=1)
+
+    cfg = TrainConfig(
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        folds=args.folds,
+        seed=args.seed,
+        jitter_range=(args.jitter_low, args.jitter_high),  # <- manuscript: [-1, 1]
+        num_workers=args.num_workers,
+    )
+
+    set_seed(cfg.seed)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    mri, wsi, ich, txt, surv = load_and_align(args.data_dir)
+    print(f"Samples after alignment: {len(surv)} | Device: {dev} | {cfg.folds}-fold CV")
+    print(f"Jitter amplitude sampled from [{cfg.jitter_range[0]}, {cfg.jitter_range[1]}] each epoch; noise std = |jr|.")
+
+    kf = KFold(n_splits=cfg.folds, shuffle=True, random_state=cfg.seed)
+    idx_all = np.arange(len(surv))
+
+    best_c = -1.0
+    best_path = None
+    fold_scores: List[float] = []
+
+    for fold_id, (tr_idx, va_idx) in enumerate(kf.split(idx_all), start=1):
+        c, pth = run_one_fold(
+            fold_id, tr_idx, va_idx,
+            mri, wsi, ich, txt, surv,
+            dev, cfg, args.out_dir
+        )
+        fold_scores.append(c)
+        if c > best_c:
+            best_c, best_path = c, pth
+
+    # Save best overall weights
+    if best_path is not None:
+        best_overall = os.path.join(args.out_dir, "best_overall.pth")
+        state = torch.load(best_path, map_location="cpu")
+        torch.save(state, best_overall)
+
+    print("\n======= CV Summary =======")
+    for i, c in enumerate(fold_scores, start=1):
+        print(f"Fold {i:02d} best Val C-index = {c:.4f}")
+    print(f"Overall best C-index = {best_c:.4f}")
+    if best_path is not None:
+        print(f"Best weights saved to: {os.path.join(args.out_dir, 'best_overall.pth')}")
+
+    sys.stdout.close()
+    sys.stdout = orig_stdout
+
+
+if __name__ == "__main__":
+    main()
 
