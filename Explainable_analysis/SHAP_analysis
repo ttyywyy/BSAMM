@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+"""
+compute_shap_multimodal.py
+--------------------------
+Compute SHAP values for a trained Surv_attention model to analyze multimodal feature importance.
+
+Inputs (in --data_dir):
+  - MRI_features.xlsx
+  - wsi_features.xlsx
+  - ich_features.xlsx
+  - Clinical_features.xlsx
+
+Outputs (in --out_dir):
+  - shap_values_all.npy
+  - shap_importance_mri.xlsx / shap_importance_wsi.xlsx / shap_importance_ich.xlsx / shap_importance_clinical.xlsx
+  - modality_contribution_bar.png / modality_contribution_pie.png
+  - MRI_top20_features_shap.png / WSI_top20_features_shap.png / ICH_top20_features_shap.png / Clinical_top20_features_shap.png
+  - ALL_shap_summary_top30.pdf / MRI_shap_summary_top20.pdf / WSI_shap_summary_top20.pdf / ICH_shap_summary_top20.pdf / Clinical_shap_summary.pdf
+
+Usage example:
+  python compute_shap_multimodal.py \
+    --data_dir ./data/shap_input \
+    --model_path ./checkpoints/best_model.pth \
+    --out_dir ./outputs/shap_analysis
+"""
+
+import os
+import math
+import argparse
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+import shap
+import matplotlib.pyplot as plt
+
+
+# ---------- Model definition (same as training) ----------
+class ModalityEncoder(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, out_dim, bias=False),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
+class self_att(nn.Module):
+    def __init__(self, input_dim: int = 768, hidden_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.query_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.key_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.value_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        Q = self.query_proj(x)
+        K = self.key_proj(x)
+        V = self.value_proj(x)
+
+        attent_value = torch.matmul(Q, K.transpose(-1, -2))
+        attent_weight = torch.softmax(attent_value / math.sqrt(self.hidden_dim), dim=-1)
+        output = torch.matmul(attent_weight, V)
+        return output
+
+
+class Surv_attention(nn.Module):
+    """Model architecture consistent with training."""
+    def __init__(self):
+        super().__init__()
+        self.MRI = ModalityEncoder(1342, 768)
+        self.attention1 = self_att(768, 256)
+        self.attention2 = self_att(256, 256)
+        self.ln = nn.LayerNorm(256, eps=1e-5, elementwise_affine=True)
+        self.for_head = nn.Sequential(
+            nn.Linear(1024, 32, bias=False),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, mri, wsi, ich, text):
+        MRI_feat = self.MRI(mri)  # [B,1342] -> [B,768]
+        combined_tensor = torch.stack([MRI_feat, wsi, ich, text], dim=1)  # [B,4,768]
+        z1 = self.attention1(combined_tensor)  # [B,4,256]
+        z3 = self.ln(z1).flatten(1)            # [B,1024]
+        risk = self.for_head(z3)               # [B,1]
+        return risk
+
+
+# ---------- Wrap to "single-input model" (for SHAP) ----------
+class WrappedSurvModel(nn.Module):
+    """
+    Input: X_concat [B, dim_mri + dim_wsi + dim_ich + dim_text]
+    Split internally into 4 modalities and feed into Surv_attention.
+    """
+    def __init__(self, base_model, dim_mri, dim_wsi, dim_ich, dim_text):
+        super().__init__()
+        self.base_model = base_model
+        self.dim_mri = dim_mri
+        self.dim_wsi = dim_wsi
+        self.dim_ich = dim_ich
+        self.dim_text = dim_text
+
+    def forward(self, x):
+        mri = x[:, :self.dim_mri]
+        start = self.dim_mri
+
+        wsi = x[:, start:start + self.dim_wsi]
+        start += self.dim_wsi
+
+        ich = x[:, start:start + self.dim_ich]
+        start += self.dim_ich
+
+        text = x[:, start:start + self.dim_text]
+        return self.base_model(mri, wsi, ich, text)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="./data/shap_input",
+        help="Directory containing 4 feature Excel files."
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="./checkpoints/best_model.pth",
+        help="Path to trained model weights (.pth)."
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="./outputs/shap_analysis",
+        help="Output directory for SHAP results."
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Device for SHAP computation: cpu or cuda"
+    )
+    parser.add_argument(
+        "--bg_size",
+        type=int,
+        default=100,
+        help="Number of background samples for SHAP."
+    )
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=20,
+        help="Top-K features to plot per modality."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed."
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    # For stability, many users prefer CPU for SHAP DeepExplainer
+    device = torch.device(args.device)
+
+    # 1) Load features
+    mri_df = pd.read_excel(os.path.join(args.data_dir, "MRI_features.xlsx"), index_col=0)
+    wsi_df = pd.read_excel(os.path.join(args.data_dir, "wsi_features.xlsx"), index_col=0)
+    ich_df = pd.read_excel(os.path.join(args.data_dir, "ich_features.xlsx"), index_col=0)
+    text_df = pd.read_excel(os.path.join(args.data_dir, "Clinical_features.xlsx"), index_col=0)
+
+    dim_mri = mri_df.shape[1]
+    dim_wsi = wsi_df.shape[1]
+    dim_ich = ich_df.shape[1]
+    dim_text = text_df.shape[1]
+
+    print("MRI dim :", dim_mri)
+    print("WSI dim :", dim_wsi)
+    print("ICH dim :", dim_ich)
+    print("Text dim:", dim_text)
+
+    # 2) Concatenate into a single matrix for Wrapped model
+    X_mri = mri_df.values.astype(np.float32)
+    X_wsi = wsi_df.values.astype(np.float32)
+    X_ich = ich_df.values.astype(np.float32)
+    X_text = text_df.values.astype(np.float32)
+
+    X_concat = np.concatenate([X_mri, X_wsi, X_ich, X_text], axis=1)  # [N, total_dim]
+    X_concat_t = torch.from_numpy(X_concat).to(device)
+
+    # 3) Load model
+    base_model = Surv_attention().to(device)
+    state = torch.load(args.model_path, map_location=device)
+    base_model.load_state_dict(state)
+    base_model.eval()
+    print("✔ Model weights loaded.")
+
+    wrapped_model = WrappedSurvModel(
+        base_model,
+        dim_mri=dim_mri,
+        dim_wsi=dim_wsi,
+        dim_ich=dim_ich,
+        dim_text=dim_text
+    ).to(device)
+    wrapped_model.eval()
+
+    # 4) Select background samples (baseline)
+    N = X_concat.shape[0]
+    n_bg = min(args.bg_size, N)
+    bg_idx = np.random.choice(N, size=n_bg, replace=False)
+    background = X_concat_t[bg_idx]
+
+    # 5) Build DeepExplainer
+    explainer = shap.DeepExplainer(wrapped_model, background)
+
+    # 6) Explain all samples
+    X_explain = X_concat_t
+    print("Computing SHAP values, N =", X_explain.shape[0])
+
+    shap_values = explainer.shap_values(X_explain, check_additivity=False)
+
+    # 6.1 Normalize SHAP output to [N, total_dim]
+    if isinstance(shap_values, list):
+        shap_values_all = shap_values[0]
+    else:
+        shap_values_all = shap_values
+
+    shap_values_all = np.array(shap_values_all)
+    if shap_values_all.ndim == 3 and shap_values_all.shape[2] == 1:
+        shap_values_all = shap_values_all[:, :, 0]
+
+    print("shap_values_all.shape =", shap_values_all.shape)
+
+    np.save(os.path.join(args.out_dir, "shap_values_all.npy"), shap_values_all)
+    print("✔ Saved shap_values_all.npy")
+
+    # 7) Global feature importance: mean |SHAP|
+    mean_abs_shap = np.abs(shap_values_all).mean(axis=0).reshape(-1)
+
+    total_dim = dim_mri + dim_wsi + dim_ich + dim_text
+    if mean_abs_shap.shape[0] != total_dim:
+        raise ValueError(f"Feature number mismatch: SHAP {mean_abs_shap.shape[0]} vs concat {total_dim}")
+
+    # 8) Split by modality
+    idx_mri_end = dim_mri
+    idx_wsi_end = dim_mri + dim_wsi
+    idx_ich_end = dim_mri + dim_wsi + dim_ich
+
+    shap_mri = mean_abs_shap[:idx_mri_end]
+    shap_wsi = mean_abs_shap[idx_mri_end:idx_wsi_end]
+    shap_ich = mean_abs_shap[idx_wsi_end:idx_ich_end]
+    shap_text = mean_abs_shap[idx_ich_end:]
+
+    # 9) Save modality importance tables
+    df_mri_imp = pd.DataFrame({"feature": mri_df.columns, "mean_abs_shap": shap_mri}).sort_values("mean_abs_shap", ascending=False)
+    df_mri_imp.to_excel(os.path.join(args.out_dir, "shap_importance_mri.xlsx"), index=False)
+
+    df_wsi_imp = pd.DataFrame({"feature": wsi_df.columns, "mean_abs_shap": shap_wsi}).sort_values("mean_abs_shap", ascending=False)
+    df_wsi_imp.to_excel(os.path.join(args.out_dir, "shap_importance_wsi.xlsx"), index=False)
+
+    df_ich_imp = pd.DataFrame({"feature": ich_df.columns, "mean_abs_shap": shap_ich}).sort_values("mean_abs_shap", ascending=False)
+    df_ich_imp.to_excel(os.path.join(args.out_dir, "shap_importance_ich.xlsx"), index=False)
+
+    df_text_imp = pd.DataFrame({"feature": text_df.columns, "mean_abs_shap": shap_text}).sort_values("mean_abs_shap", ascending=False)
+    df_text_imp.to_excel(os.path.join(args.out_dir, "shap_importance_clinical.xlsx"), index=False)
+
+    print("✔ Saved feature importance tables to:", args.out_dir)
+
+    # 10) Modality-level contribution (bar + pie)
+    mri_contrib = np.mean(np.abs(shap_mri))
+    wsi_contrib = np.mean(np.abs(shap_wsi))
+    ich_contrib = np.mean(np.abs(shap_ich))
+    text_contrib = np.mean(np.abs(shap_text))
+
+    modalities = ["MRI", "WSI", "ICH", "Clinical"]
+    values = [mri_contrib, wsi_contrib, ich_contrib, text_contrib]
+
+    plt.figure(figsize=(6, 6))
+    plt.bar(modalities, values)
+    plt.ylabel("Mean |SHAP value|")
+    plt.title("Modality-level contribution to recurrence risk")
+    plt.tight_layout()
